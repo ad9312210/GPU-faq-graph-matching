@@ -1,0 +1,225 @@
+{
+  "exp1": [
+    {
+      "n": 100,
+      "t_scipy": 0.793100000009872,
+      "acc_scipy": 0.4,
+      "t_goat": 56.68660000083037,
+      "acc_goat": 1.0,
+      "t_sparse": 16.13349999934144,
+      "acc_sparse": 0.93,
+      "best_acc": 1.0
+    },
+    {
+      "n": 200,
+      "t_scipy": 2.9869999998481944,
+      "acc_scipy": 0.28,
+      "t_goat": 249.38119999933406,
+      "acc_goat": 1.0,
+      "t_sparse": 34.74149999965448,
+      "acc_sparse": 0.9447236180904522,
+      "best_acc": 1.0
+    },
+    {
+      "n": 500,
+      "t_scipy": 13.538899998820852,
+      "acc_scipy": 0.128,
+      "t_goat": 1368.8858999994409,
+      "acc_goat": 1.0,
+      "t_sparse": 118.6202000008052,
+      "acc_sparse": 0.8904665314401623,
+      "best_acc": 1.0
+    },
+    {
+      "n": 1000,
+      "t_scipy": 67.53030000072613,
+      "acc_scipy": 0.074,
+      "t_goat": 8411.242899999706,
+      "acc_goat": 1.0,
+      "t_sparse": 237.71929999929853,
+      "acc_sparse": 0.8686354378818737,
+      "best_acc": 1.0
+    },
+    {
+      "n": 2000,
+      "t_scipy": 331.68619999923976,
+      "acc_scipy": 0.0445,
+      "t_goat": 57617.14369999936,
+      "acc_goat": 1.0,
+      "t_sparse": 569.0020999991248,
+      "acc_sparse": 0.8528205128205129,
+      "best_acc": 1.0
+    }
+  ],
+  "exp2": [
+    {
+      "type": "BA Scale-Free",
+      "t_scipy": 11.712499999703141,
+      "acc_scipy": 0.128,
+      "t_goat": 1370.2252000002773,
+      "acc_goat": 1.0,
+      "t_sparse": 103.51160000027448,
+      "acc_sparse": 0.8904665314401623
+    },
+    {
+      "type": "WS Small-World",
+      "t_scipy": 9.786099999473663,
+      "acc_scipy": 0.062,
+      "t_goat": 2187.7948000001197,
+      "acc_goat": 1.0,
+      "t_sparse": 46.394799999688985,
+      "acc_sparse": 0.7857142857142857
+    },
+    {
+      "type": "ER Random",
+      "t_scipy": 11.348799998813774,
+      "acc_scipy": 0.036,
+      "t_goat": 2464.57829999963,
+      "acc_goat": 1.0,
+      "t_sparse": 974.3207999999868,
+      "acc_sparse": 0.5786290322580645
+    },
+    {
+      "type": "SBM Clustered",
+      "t_scipy": 13.93869999992603,
+      "acc_scipy": 0.046,
+      "t_goat": 2605.109399999492,
+      "acc_goat": 1.0,
+      "t_sparse": 831.017200000133,
+      "acc_sparse": 0.5890688259109311
+    }
+  ],
+  "exp3": [
+    {
+      "name": "Karate",
+      "n": 34,
+      "t_scipy": 0.16210000103455968,
+      "acc_scipy": 0.14705882352941177,
+      "t_goat": 2.6795999983733054,
+      "acc_goat": 1.0,
+      "t_sparse": null,
+      "acc_sparse": null
+    },
+    {
+      "name": "Les Miserables",
+      "n": 77,
+      "t_scipy": 0.24949999897216912,
+      "acc_scipy": 0.24675324675324675,
+      "t_goat": 18.47259999885864,
+      "acc_goat": 0.7922077922077922,
+      "t_sparse": 9.075800000573508,
+      "acc_sparse": 0.34285714285714286
+    },
+    {
+      "name": "Florentine Families",
+      "n": 15,
+      "t_scipy": 0.09890000001178123,
+      "acc_scipy": 0.4,
+      "t_goat": 1.5791999994689832,
+      "acc_goat": 1.0,
+      "t_sparse": 2.3331000011239666,
+      "acc_sparse": 1.0
+    },
+    {
+      "name": "Davis Women",
+      "n": 32,
+      "t_scipy": 0.10850000035134144,
+      "acc_scipy": 0.59375,
+      "t_goat": 3.125400000499212,
+      "acc_goat": 1.0,
+      "t_sparse": 4.041700000016135,
+      "acc_sparse": 0.6774193548387096
+    }
+  ],
+  "exp4": [
+    {
+      "n": 200,
+      "t_scipy": 2.776600000288454,
+      "acc_scipy": 0.28,
+      "t_gpu_hungarian": 855.1951999997982,
+      "acc_gpu_hungarian": 0.405,
+      "t_gpu_auction": 18.401999999696272,
+      "acc_gpu_auction": 0.405,
+      "t_gpu_parallel_greedy": 92.59660000134318,
+      "acc_gpu_parallel_greedy": 0.045
+    },
+    {
+      "n": 500,
+      "t_scipy": 12.677299999268143,
+      "acc_scipy": 0.128,
+      "t_gpu_hungarian": 30.16639999987092,
+      "acc_gpu_hungarian": 0.234,
+      "t_gpu_auction": 39.79749999962223,
+      "acc_gpu_auction": 0.234,
+      "t_gpu_parallel_greedy": 26.687499999752617,
+      "acc_gpu_parallel_greedy": 0.054
+    },
+    {
+      "n": 1000,
+      "t_scipy": 67.72940000155359,
+      "acc_scipy": 0.074,
+      "t_gpu_hungarian": 100.50570000021253,
+      "acc_gpu_hungarian": 0.277,
+      "t_gpu_auction": 123.00349999895843,
+      "acc_gpu_auction": 0.277,
+      "t_gpu_parallel_greedy": 117.75499999930616,
+      "acc_gpu_parallel_greedy": 0.066
+    },
+    {
+      "n": 2000,
+      "t_scipy": 389.4829999990179,
+      "acc_scipy": 0.0445,
+      "t_gpu_hungarian": 541.8123999988893,
+      "acc_gpu_hungarian": 0.0965,
+      "t_gpu_auction": 763.1892999997945,
+      "acc_gpu_auction": 0.0965,
+      "t_gpu_parallel_greedy": 314.53529999998864,
+      "acc_gpu_parallel_greedy": 0.041
+    }
+  ],
+  "exp5": [
+    {
+      "n": 100,
+      "dense_mb": 0.03814697265625,
+      "sparse_mb": 0.0057220458984375,
+      "reduction": 6.666666666666667
+    },
+    {
+      "n": 500,
+      "dense_mb": 0.95367431640625,
+      "sparse_mb": 0.0286102294921875,
+      "reduction": 33.333333333333336
+    },
+    {
+      "n": 1000,
+      "dense_mb": 3.814697265625,
+      "sparse_mb": 0.057220458984375,
+      "reduction": 66.66666666666667
+    },
+    {
+      "n": 2000,
+      "dense_mb": 15.2587890625,
+      "sparse_mb": 0.11444091796875,
+      "reduction": 133.33333333333334
+    },
+    {
+      "n": 5000,
+      "dense_mb": 95.367431640625,
+      "sparse_mb": 0.286102294921875,
+      "reduction": 333.3333333333333
+    },
+    {
+      "n": 10000,
+      "dense_mb": 381.4697265625,
+      "sparse_mb": 0.57220458984375,
+      "reduction": 666.6666666666666
+    }
+  ],
+  "exp6": [
+    {
+      "n": 200,
+      "mean": 37.55540000020119,
+      "p50": 36.39814999951341,
+      "p95": 40.725744999508606,
+      "p99": 41.15698899855488,
+      "realtime": 
