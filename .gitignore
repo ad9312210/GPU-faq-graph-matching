@@ -1,0 +1,54 @@
+# Native build products and CMake state
+/build-*/
+/build/
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+compile_commands.json
+Makefile
+Testing/
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+
+# Python caches, local environments, and tooling state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+
+# Generated experiment data and benchmark outputs
+/data/
+/results/
+/datasets/
+/logs/
+/reports/
+/figures/
+/experiments/diagrams/
+
+# Local or unpublished research material
+/*.pdf
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Machine-specific CMake configuration
+CMakeUserPresets.json

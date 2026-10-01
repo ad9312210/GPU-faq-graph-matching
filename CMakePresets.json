@@ -1,0 +1,83 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "release-native",
+      "displayName": "Release with native CUDA architecture",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SCGM_CUDA_ARCHITECTURES": "native",
+        "SCGM_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "debug-native",
+      "displayName": "Debug with native CUDA architecture",
+      "inherits": "release-native",
+      "binaryDir": "${sourceDir}/build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release-l40s",
+      "displayName": "Release for NVIDIA L40S with CUDA 12",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-l40s",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc",
+        "SCGM_CUDA_ARCHITECTURES": "89",
+        "CMAKE_CUDA_ARCHITECTURES": "89",
+        "SCGM_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release-native",
+      "configurePreset": "release-native",
+      "jobs": 0
+    },
+    {
+      "name": "debug-native",
+      "configurePreset": "debug-native",
+      "jobs": 0
+    },
+    {
+      "name": "release-l40s",
+      "configurePreset": "release-l40s",
+      "jobs": 0
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "release-native",
+      "configurePreset": "release-native",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "debug-native",
+      "configurePreset": "debug-native",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release-l40s",
+      "configurePreset": "release-l40s",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
