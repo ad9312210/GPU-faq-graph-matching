@@ -3,7 +3,8 @@
 SCGM is a native C++17/CUDA implementation and Python experiment harness for
 sparse candidate graph matching. The native backend extracts structural vertex
 features, generates Top-K candidates, builds sparse CSR costs, and solves the
-assignment with CPU LAPJV. CUDA accelerates feature extraction and candidate
+assignment with a CPU sparse primal-dual shortest-augmenting-path solver
+(the historical `solve_lapjv` interface name is retained). CUDA accelerates feature extraction and candidate
 generation; assignment and sparse Sinkhorn diagnostics remain on the CPU.
 
 This repository is a research artifact, not a complete reproduction of the
@@ -16,7 +17,8 @@ the implementation that is actually present here.
   degree, neighbor-degree standard deviation, triangle participation, and
   degree squared.
 - CPU and CUDA feature extraction and Top-K candidate generation.
-- Sparse CSR cost construction and native CPU LAPJV assignment.
+- Sparse CSR cost construction and native CPU shortest-augmenting-path assignment.
+- Optional CPU structural-index candidates, with recorded policy and exhaustive fallback.
 - CPU sparse Sinkhorn diagnostics.
 - Native unit tests, CPU/GPU parity tests, paired-graph generation, and
   experiment and benchmark scripts.
@@ -25,6 +27,22 @@ The GPU path is hybrid: feature and candidate processing run on the GPU, while
 the CSR assignment and Sinkhorn stages run on the host CPU. The implementation
 does not provide GPU LAPJV, GPU-resident Sinkhorn, multi-GPU execution, or the
 large-scale guarantees described in the paper draft.
+
+## Supported structural-index result
+
+The [CPU pilot findings](docs/structural_index_findings.md) document one noiseless
+ca-GrQc seed-11 pair at K64: 65.27% fewer scored pairs, 2.10x median candidate-stage
+ratio including index setup, and unchanged 89.73% candidate recall. Both supports
+matched only 4,703/5,241 sources. Final accuracy and complete-pipeline speedup are
+unavailable; separate host-RSS profiles showed no measured reduction.
+
+The indexed command-line backend is CPU-only. GPU index construction and retrieval
+planning exist, but GPU indexed scoring is not integrated. This CPU pilot provides
+no GPU performance or executed GPU-parity evidence. See the findings for the exact
+three-repeat reproduction command and provenance limitations; broader K/seed
+commands later in this README are proposed additional experiments, not completed
+results. The [design](docs/structural_index_design.md) distinguishes completed and
+pending milestones.
 
 ## Repository Layout
 
@@ -173,3 +191,85 @@ the diff with `git status` and `git diff`. Never commit build directories,
 Python caches, local credentials, generated results, logs, reports, diagrams,
 figures, or unpublished research material. Use `git add -f` only when a normally
 ignored artifact is intentionally being released.
+
+## Optional CPU structural-index candidates
+
+The default candidate backend remains `exhaustive`. The CPU indexed backend
+uses raw log-degree/log-mean-neighbor-degree buckets, complete Chebyshev shells,
+and exhaustive per-source fallback. It ranks retrieved targets with the existing
+normalized six-feature cosine score. Retrieval is not an exhaustive Top-K guarantee.
+
+```bash
+./build-l40s/scgm_cuda \
+  --source data/G01-ca-GrQc/seed_11/source.graph \
+  --target data/G01-ca-GrQc/seed_11/target.graph \
+  --cpu --k 64 --candidate-backend structural-index \
+  --index-degree-width 0.5 --index-neighbor-width 0.5 \
+  --index-min-radius 1 --index-max-radius 3 \
+  --index-pool-multiplier 4 --index-fallback exhaustive \
+  --timings /tmp/scgm-indexed-timings.json
+```
+
+Index options require the structural-index backend. GPU indexed scoring, fixed
+candidate input, and scoring ablations are explicitly rejected with this backend.
+GPU index construction/retrieval tests do not make GPU indexed scoring available.
+
+`experiments/run_native_experiment.py` and `experiments/benchmark_native.py`
+accept the same candidate/index options (use `--mode cpu` rather than `--cpu`).
+They verify native-reported backend/settings and append a configuration hash to
+run directories; benchmark output is now under `OUTPUT/config_HASH/benchmark.json`.
+The hash includes input/executable fingerprints and execution settings. Native
+attempt metadata preserves effective K and index diagnostics separately from
+runner-controlled support repair. The benchmark runner does not perform repair.
+
+Timing JSON records requested/effective mode, configuration, index build time,
+occupied buckets, pool sizes, fallback count, and actual scored pairs. Indexed
+`candidate_generation_ms` includes retrieval, scoring, and Top-K but excludes
+`index_build_ms`; setup-inclusive comparisons must count both. Separate indexed
+similarity/Top-K/retrieval times and unmeasured scratch/host peak memory are null,
+not zero. Index storage bytes describe stored arrays, not whole-process peak RSS.
+These integration checks do not establish a real-data quality or speedup claim.
+
+## Paired quality/performance comparison
+
+Use `experiments/benchmark_structural_index.py` to compare exhaustive and indexed
+CPU generation on the identical saved pair. For example:
+
+```bash
+python3 experiments/benchmark_structural_index.py \
+  --source data/G01-ca-GrQc/seed_11/source.graph \
+  --target data/G01-ca-GrQc/seed_11/target.graph \
+  --ground-truth data/G01-ca-GrQc/seed_11/ground_truth.csv \
+  --ks 16 64 128 --warmup 1 --trials 5 \
+  --index-degree-width 0.5 --index-neighbor-width 0.5 \
+  --index-min-radius 1 --index-max-radius 3 --index-pool-multiplier 4 \
+  --output results/structural_index_comparison
+```
+
+Outputs are under `OUTPUT/comparison_HASH/comparison.json`, with per-K backend
+candidate/assignment artifacts and trial metadata. This command performs the
+listed runs, not just plotting. Repeat explicitly on separate pairs/seeds and
+noise levels; choose index settings independently of reported test labels.
+
+Quality/export runs and separate GNU `/usr/bin/time` RSS profiles are excluded
+from timing trials. Timed backends alternate order by trial and do not export
+candidate CSVs (both still write assignments/timing metadata). Host RSS is the
+native process high-water mark from an isolated profile, not the Python process
+or a cumulative child-process maximum. Use `--skip-memory-profile` to leave RSS
+unavailable; CPU comparisons have no applicable GPU memory reduction metric.
+
+Reports distinguish exact candidate-ID overlap from the fraction of indexed
+scores strictly below the exhaustive cutoff (within the saved tolerance). Recall
+loss/gain refers to retained Top-K/support, not pre-Top-K retrieved-pool recall.
+Final accuracy and edge preservation are unavailable for invalid assignments.
+No repair is performed. If either support is infeasible, complete-pipeline
+speedup is null: its assignment/Sinkhorn work was skipped. Raw wall ratios remain
+labeled observations and must not be presented as successful matching speedups.
+Candidate-stage ratios include index construction. Whole-process RSS, CSR storage,
+and index-array storage are different metrics and must not be conflated.
+
+Helper-metric checks:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_benchmark_structural_index.py'
+```

@@ -52,6 +52,11 @@ set(LIB_SOURCES
     cuda/gpu_matching.cu
     #src/evaluation.cpp
     src/evaluation.cpp
+
+    #src/structural_index.cpp
+    src/structural_index.cpp
+
+    cuda/structural_index.cu
 )
 
 add_library(scgm_lib STATIC ${LIB_SOURCES})
@@ -97,11 +102,13 @@ if(SCGM_BUILD_TESTS)
         tests/test_features.cpp
         tests/test_permutation.cpp
         tests/test_csr.cpp
+        tests/test_structural_index.cpp
         tests/test_topk.cpp
         tests/test_lapjv.cpp
         tests/test_sparse_sinkhorn.cpp
         tests/test_cpu_gpu_parity.cpp
         tests/test_toy_scgm.cpp
+        tests/test_gpu_structural_index.cpp
     )
 
     foreach(test_file ${TEST_SOURCES})
@@ -110,6 +117,9 @@ if(SCGM_BUILD_TESTS)
         target_link_libraries(${test_name} PRIVATE scgm_lib)
         add_test(NAME ${test_name} COMMAND ${test_name})
     endforeach()
+
+    # Exit 77 means GPU hardware was unavailable, not a successful parity check.
+    set_tests_properties(test_gpu_structural_index PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")

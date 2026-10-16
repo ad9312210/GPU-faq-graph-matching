@@ -1,12 +1,13 @@
 #include "features.hpp"
+using namespace std;
 
-std::vector<NodeFeatures> compute_features(const Graph& g) {
+vector<NodeFeatures> compute_features(const Graph& g) {
     validate_graph(g);
 
     const int n = g.num_vertices;
-    std::vector<NodeFeatures> feats(n);
-    std::vector<int> degrees(n);
-    std::vector<int> triangle_counts(n, 0);
+    vector<NodeFeatures> feats(n);
+    vector<int> degrees(n);
+    vector<int> triangle_counts(n, 0);
 
     for (int v = 0; v < n; ++v) {
         degrees[v] = degree(g, v);
@@ -65,7 +66,7 @@ std::vector<NodeFeatures> compute_features(const Graph& g) {
                 const float delta = static_cast<float>(degrees[nb]) - mean;
                 squared_deviation_sum += delta * delta;
             }
-            feats[v].neighbor_degree_std = std::sqrt(
+            feats[v].neighbor_degree_std = sqrt(
                 squared_deviation_sum / static_cast<float>(nbrs.size() - 1));
         }
     }
@@ -79,7 +80,7 @@ std::vector<NodeFeatures> compute_features(const Graph& g) {
  * NOTE: This does NOT guarantee non-negative values.
  * Negative values are expected and valid for cosine similarity.
  */
-void normalize_features_zscore(std::vector<NodeFeatures>& feats) {
+void normalize_features_zscore(vector<NodeFeatures>& feats) {
     int N = (int)feats.size();
     if (N == 0) return;
 
@@ -95,7 +96,7 @@ void normalize_features_zscore(std::vector<NodeFeatures>& feats) {
             float diff = feats[i].as_array(f) - mean;
             var_sum += diff * diff;
         }
-        float std_dev = std::sqrt(var_sum / (float)N);
+        float std_dev = sqrt(var_sum / (float)N);
         if (std_dev < SCGM_EPS) std_dev = 1.0f;
 
         for (int i = 0; i < N; i++) {
@@ -113,8 +114,8 @@ void normalize_features_zscore(std::vector<NodeFeatures>& feats) {
     }
 }
 
-void normalize_features_joint_zscore(std::vector<NodeFeatures>& source,
-                                     std::vector<NodeFeatures>& target) {
+void normalize_features_joint_zscore(vector<NodeFeatures>& source,
+                                     vector<NodeFeatures>& target) {
     const int total = static_cast<int>(source.size() + target.size());
     if (total == 0) return;
 
@@ -133,7 +134,7 @@ void normalize_features_joint_zscore(std::vector<NodeFeatures>& source,
             float diff = feature.as_array(f) - mean;
             var_sum += diff * diff;
         }
-        float std_dev = std::sqrt(var_sum / static_cast<float>(total));
+        float std_dev = sqrt(var_sum / static_cast<float>(total));
         if (std_dev < SCGM_EPS) std_dev = 1.0f;
 
         auto normalize_feature = [f, mean, std_dev](NodeFeatures& feature) {
@@ -152,8 +153,8 @@ void normalize_features_joint_zscore(std::vector<NodeFeatures>& source,
     }
 }
 
-void features_to_flat_array(const std::vector<NodeFeatures>& feats,
-                            std::vector<float>& out) {
+void features_to_flat_array(const vector<NodeFeatures>& feats,
+                            vector<float>& out) {
     int N = (int)feats.size();
     out.resize(N * NUM_FEATURES);
     for (int i = 0; i < N; i++) {
@@ -163,8 +164,8 @@ void features_to_flat_array(const std::vector<NodeFeatures>& feats,
     }
 }
 
-void flat_array_to_features(const std::vector<float>& arr, int n,
-                            std::vector<NodeFeatures>& out) {
+void flat_array_to_features(const vector<float>& arr, int n,
+                            vector<NodeFeatures>& out) {
     out.resize(n);
     for (int i = 0; i < n; i++) {
         out[i].degree = arr[i * NUM_FEATURES + 0];

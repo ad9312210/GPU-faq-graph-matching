@@ -12,6 +12,9 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from index_cli import (add_index_arguments, index_configuration,
+                       native_index_arguments, verify_index_metadata, configuration_id)
+
 
 import numpy as np
 from analyze_feature_candidates import audit as audit_features
@@ -180,7 +183,9 @@ def main():
     parser.add_argument("--skip-independent-matching-check", action="store_true",
                         help="Use the native Hopcroft-Karp result instead of recomputing it with SciPy")
     parser.add_argument("--output-dir", type=Path, required=True)
+    add_index_arguments(parser)
     args = parser.parse_args()
+    index_config = index_configuration(args, parser)
 
     for path in (args.executable, args.source, args.target, args.ground_truth):
         if not path.is_file():
@@ -192,6 +197,15 @@ def main():
         parser.error("--repair-max-k must be at least --k")
 
     name = run_name(args.dataset, args.pair_seed, args.noise_percent, args.method, args.k)
+    requested = {"candidate_backend": args.candidate_backend, "structural_index": index_config,
+                 "mode": args.mode, "k": args.k, "repair_max_k": args.repair_max_k,
+                 "support_repair_enabled": not args.no_support_repair,
+                 "skip_feature_audit": args.skip_feature_audit,
+                 "skip_independent_matching_check": args.skip_independent_matching_check,
+                 "source_sha256": sha256_file(args.source), "target_sha256": sha256_file(args.target),
+                 "ground_truth_sha256": sha256_file(args.ground_truth),
+                 "executable_sha256": sha256_file(args.executable)}
+    name += "__cfg" + configuration_id(requested)
     pair_manifest_path = args.target.parent / "manifest.json"
     pair_manifest = None
     if pair_manifest_path.is_file():
@@ -216,6 +230,7 @@ def main():
     run_dir = args.output_dir / name
     checks_dir = run_dir / "support_checks"
     checks_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "configuration.json").write_text(json.dumps(requested, indent=2) + "\n")
     history = []
     attempt_wall_ms = []
     support_diagnostic_ms = []
@@ -240,11 +255,15 @@ def main():
             "--k", str(current_k), f"--{args.mode}", "--candidates", str(candidates_path),
             "--output", str(assignment_path), "--timings", str(timings_path),
         ]
+        command.extend(native_index_arguments(args.candidate_backend, index_config))
         start = time.perf_counter()
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
         wall_ms = (time.perf_counter() - start) * 1000.0
         attempt_wall_ms.append(wall_ms)
         native = json.loads(timings_path.read_text(encoding="utf-8")) if timings_path.exists() else {}
+        if completed.returncode not in (0, 2):
+            raise RuntimeError(f"native execution failed: {completed.stderr}")
+        verify_index_metadata(native, args.candidate_backend, index_config, args.mode)
         if not candidates_path.exists():
             raise RuntimeError(f"native run did not write candidates at K={current_k}: {completed.stderr}")
         coverage_path = attempt_dir / "target_candidate_coverage.csv"
@@ -267,6 +286,8 @@ def main():
             raise RuntimeError(f"native/Python maximum-matching mismatch at K={current_k}")
 
         checkpoint = {
+            "structural_index": native.get("structural_index"),
+            "index_diagnostics": native.get("index_diagnostics"),
             "k": current_k,
             "candidate_recall": support["candidate_recall"],
             "zero_incoming_targets": support["zero_incoming_targets"],
@@ -281,7 +302,7 @@ def main():
             "stage_timings_ms": {
                 key: native.get(key) for key in (
                     "feature_extraction_ms", "similarity_ms", "topk_selection_ms",
-                    "candidate_generation_ms", "host_device_transfer_ms",
+                    "candidate_generation_ms", "index_build_ms", "host_device_transfer_ms",
                     "csr_construction_ms", "lapjv_ms", "sinkhorn_ms",
                 )
             },
@@ -367,12 +388,12 @@ def main():
     aggregate_stage_timings = {}
     for stage in (
         "feature_extraction_ms", "similarity_ms", "topk_selection_ms",
-        "candidate_generation_ms", "host_device_transfer_ms",
+        "candidate_generation_ms", "index_build_ms", "host_device_transfer_ms",
         "csr_construction_ms", "lapjv_ms", "sinkhorn_ms",
     ):
-        aggregate_stage_timings[stage] = sum(
-            float(check["stage_timings_ms"].get(stage) or 0.0) for check in history
-        )
+        values = [check["stage_timings_ms"].get(stage) for check in history]
+        aggregate_stage_timings[stage] = (None if any(v is None for v in values)
+                                          else sum(float(v) for v in values))
     peak_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     peak_rss_bytes = int(peak_rss * (1024 if platform.system() == "Linux" else 1))
     failure_reason = None
@@ -380,6 +401,14 @@ def main():
         failure_reason = completed.stderr.strip() or assignment_status
 
     result = {
+        "support_repair": {"enabled": not args.no_support_repair,
+                           "initial_k": args.k, "k_cap": args.repair_max_k,
+                           "rounds": max(0, len(history)-1),
+                           "note": "Separate from bucket-neighborhood expansion and exhaustive retrieval fallback"},
+        "requested_configuration": requested,
+        "candidate_backend": args.candidate_backend,
+        "structural_index": final_native.get("structural_index"),
+        "index_diagnostics": final_native.get("index_diagnostics"),
         "run_name": name,
         "dataset": args.dataset,
         "pair_seed": args.pair_seed,
@@ -401,7 +430,7 @@ def main():
         "final_attempt_stage_timings_ms": {
             key: final_native.get(key) for key in (
                 "feature_extraction_ms", "similarity_ms", "topk_selection_ms",
-                "candidate_generation_ms", "host_device_transfer_ms",
+                "candidate_generation_ms", "index_build_ms", "host_device_transfer_ms",
                 "csr_construction_ms", "lapjv_ms", "sinkhorn_ms",
             )
         },

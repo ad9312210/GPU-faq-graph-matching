@@ -1,7 +1,8 @@
 #include "csr_matrix.hpp"
+using namespace std;
 
 CSRMatrix build_sparse_cost_matrix(
-    const std::vector<std::vector<Candidate>>& candidates,
+    const vector<vector<Candidate>>& candidates,
     int num_source,
     int num_target)
 {
@@ -23,8 +24,8 @@ CSRMatrix build_sparse_cost_matrix(
     for (int i = 0; i < num_source; i++) {
         int offset = csr.row_ptr[i];
         // Sort candidates by target index for CSR convention
-        std::vector<Candidate> sorted_cands = candidates[i];
-        std::sort(sorted_cands.begin(), sorted_cands.end(),
+        vector<Candidate> sorted_cands = candidates[i];
+        sort(sorted_cands.begin(), sorted_cands.end(),
                   [](const Candidate& a, const Candidate& b) {
                       return a.target < b.target;
                   });
@@ -54,28 +55,28 @@ float get_value(const CSRMatrix& matrix, int row, int col) {
 
 bool validate_csr(const CSRMatrix& matrix, int K) {
     if ((int)matrix.row_ptr.size() != matrix.rows + 1) {
-        std::cerr << "CSR validation failed: row_ptr size = " << matrix.row_ptr.size()
+        cerr << "CSR validation failed: row_ptr size = " << matrix.row_ptr.size()
                   << ", expected " << matrix.rows + 1 << std::endl;
         return false;
     }
     if (matrix.row_ptr[0] != 0) {
-        std::cerr << "CSR validation failed: row_ptr[0] = " << matrix.row_ptr[0] << std::endl;
+        cerr << "CSR validation failed: row_ptr[0] = " << matrix.row_ptr[0] << std::endl;
         return false;
     }
     int nnz = matrix.row_ptr[matrix.rows];
     if ((int)matrix.col_idx.size() != nnz) {
-        std::cerr << "CSR validation failed: col_idx.size() = " << matrix.col_idx.size()
+        cerr << "CSR validation failed: col_idx.size() = " << matrix.col_idx.size()
                   << ", expected " << nnz << std::endl;
         return false;
     }
     if ((int)matrix.values.size() != nnz) {
-        std::cerr << "CSR validation failed: values.size() = " << matrix.values.size()
+        cerr << "CSR validation failed: values.size() = " << matrix.values.size()
                   << ", expected " << nnz << std::endl;
         return false;
     }
     for (int i = 0; i < matrix.rows; i++) {
         if (matrix.row_ptr[i + 1] < matrix.row_ptr[i]) {
-            std::cerr << "CSR validation failed: row_ptr not monotonically increasing at row "
+            cerr << "CSR validation failed: row_ptr not monotonically increasing at row "
                       << i << std::endl;
             return false;
         }

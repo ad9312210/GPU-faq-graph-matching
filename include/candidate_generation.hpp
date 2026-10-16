@@ -3,6 +3,7 @@
 
 #include "common.hpp"
 #include "features.hpp"
+#include "structural_index.hpp"
 
 struct Candidate {
     int target;
@@ -35,5 +36,18 @@ std::vector<std::vector<Candidate>> generate_top_k_candidates(
     float neighbor_profile_weight = 0.0f,
     double* similarity_ms = nullptr,
     double* topk_selection_ms = nullptr);
+
+
+// Optional CPU indexed backend. raw_sources are BEFORE normalization;
+// scoring arrays use the existing normalization and standard six-feature cosine.
+// target_index must correspond to scoring_targets in exactly the same ID order.
+// No profiles/weights are added in this initial indexed variant.
+std::vector<std::vector<Candidate>> generate_indexed_top_k_candidates(
+    const std::vector<NodeFeatures>& raw_sources,
+    const std::vector<NodeFeatures>& scoring_sources,
+    const std::vector<NodeFeatures>& scoring_targets,
+    const StructuralIndex& target_index,
+    int k,
+    std::vector<StructuralRetrievalStats>* retrieval_stats = nullptr);
 
 #endif // SCGM_CANDIDATE_GENERATION_HPP

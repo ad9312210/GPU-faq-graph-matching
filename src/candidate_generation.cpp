@@ -133,3 +133,58 @@ std::vector<std::vector<Candidate>> generate_top_k_candidates(
     if (topk_selection_ms) *topk_selection_ms = topk_elapsed_ms;
     return candidates;
 }
+
+
+std::vector<std::vector<Candidate>> generate_indexed_top_k_candidates(
+    const std::vector<NodeFeatures>& raw_sources,
+    const std::vector<NodeFeatures>& scoring_sources,
+    const std::vector<NodeFeatures>& scoring_targets,
+    const StructuralIndex& target_index,
+    int k,
+    std::vector<StructuralRetrievalStats>* retrieval_stats
+) {
+    validate_structural_index_config(target_index.config);
+    if (raw_sources.size() != scoring_sources.size() ||
+        scoring_targets.size() != target_index.target_count) {
+        throw std::invalid_argument("indexed raw/scoring feature dimensions disagree");
+    }
+    if (k <= 0 || (!raw_sources.empty() &&
+        static_cast<std::size_t>(k) > scoring_targets.size())) {
+        throw std::invalid_argument("indexed candidates require valid positive k");
+    }
+    for (const auto* features : {&scoring_sources, &scoring_targets}) {
+        for (const auto& feature : *features) {
+            for (int coordinate = 0; coordinate < NUM_FEATURES; ++coordinate) {
+                if (!std::isfinite(feature.as_array(coordinate)))
+                    throw std::invalid_argument("nonfinite indexed scoring feature");
+            }
+        }
+    }
+    if (retrieval_stats) retrieval_stats->clear();
+    std::vector<std::vector<Candidate>> output(raw_sources.size());
+    auto better = [](const Candidate& a, const Candidate& b) {
+        return a.similarity > b.similarity ||
+            (a.similarity == b.similarity && a.target < b.target);
+    };
+    for (std::size_t source = 0; source < raw_sources.size(); ++source) {
+        auto pool = retrieve_structural_candidates(target_index, raw_sources[source], k);
+        // Bound scoring scratch by K, including oversized buckets/fallback.
+        std::priority_queue<Candidate, std::vector<Candidate>, decltype(better)> heap(better);
+        for (int target : pool.target_ids) {
+            const float similarity = cosine_similarity(scoring_sources[source], scoring_targets[target]);
+            if (!std::isfinite(similarity))
+                throw std::runtime_error("nonfinite indexed cosine score");
+            Candidate candidate{target, similarity};
+            if (heap.size() < static_cast<std::size_t>(k)) heap.push(candidate);
+            else if (better(candidate, heap.top())) {
+                heap.pop();
+                heap.push(candidate);
+            }
+        }
+        auto& row = output[source];
+        while (!heap.empty()) { row.push_back(heap.top()); heap.pop(); }
+        std::sort(row.begin(), row.end(), better);
+        if (retrieval_stats) retrieval_stats->push_back(pool.stats);
+    }
+    return output;
+}

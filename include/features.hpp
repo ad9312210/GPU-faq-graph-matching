@@ -3,7 +3,8 @@
 
 #include "common.hpp"
 #include "graph.hpp"
-
+using namespace std;
+using namespace std::chrono;
 /*
  * The six primary structural descriptors defined by the paper:
  *   1. Degree
@@ -43,7 +44,7 @@ struct NodeFeatures {
 static constexpr int NUM_FEATURES = 6;
 static constexpr unsigned int ALL_FEATURES_MASK = (1u << NUM_FEATURES) - 1u;
 
-std::vector<NodeFeatures> compute_features(const Graph& g);
+vector<NodeFeatures> compute_features(const Graph& g);
 
 /*
  * Feature normalization.
@@ -56,15 +57,15 @@ std::vector<NodeFeatures> compute_features(const Graph& g);
  *     S(a,b) = dot(a,b) / (||a|| ||b||)
  * works for any real-valued vectors.
  */
-void normalize_features_zscore(std::vector<NodeFeatures>& feats);
+void normalize_features_zscore(vector<NodeFeatures>& feats);
 
-void normalize_features_joint_zscore(std::vector<NodeFeatures>& source,
-                                     std::vector<NodeFeatures>& target);
+void normalize_features_joint_zscore(vector<NodeFeatures>& source,
+                                     vector<NodeFeatures>& target);
 
-void features_to_flat_array(const std::vector<NodeFeatures>& feats,
-                            std::vector<float>& out);
+void features_to_flat_array(const vector<NodeFeatures>& feats,
+                            vector<float>& out);
 
-void flat_array_to_features(const std::vector<float>& arr, int n,
-                            std::vector<NodeFeatures>& out);
+void flat_array_to_features(const vector<float>& arr, int n,
+                            vector<NodeFeatures>& out);
 
 #endif // SCGM_FEATURES_HPP

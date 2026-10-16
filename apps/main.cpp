@@ -11,6 +11,34 @@
 #include "evaluation.hpp"
 #include "device_memory_sampler.hpp"
 
+struct CandidateOptions {
+    std::string backend = "exhaustive";
+    StructuralIndexConfig index;
+    bool explicit_index_options = false;
+};
+
+static std::string measured_time_json(double value, bool available) {
+    if (!available) return "null";
+    std::ostringstream output;
+    output << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
+    return output.str();
+}
+
+static int parse_index_int(const std::string& value) {
+    size_t used = 0;
+    int result = std::stoi(value, &used);
+    if (used != value.size()) throw std::invalid_argument("Invalid index integer: " + value);
+    return result;
+}
+
+static double parse_index_double(const std::string& value) {
+    size_t used = 0;
+    double result = std::stod(value, &used);
+    if (used != value.size() || !std::isfinite(result))
+        throw std::invalid_argument("Invalid index number: " + value);
+    return result;
+}
+
 // The six-node asymmetric correctness test graph
 static void build_toy_graphs(Graph& source, Graph& target,
                               std::vector<int>& ground_truth,
@@ -329,7 +357,8 @@ static int run_from_files(const std::string& source_file,
                             unsigned int feature_mask,
                             const std::vector<float>& feature_weights,
                             float neighbor_profile_weight,
-                            const std::string& timings_file) {
+                            const std::string& timings_file,
+                            const CandidateOptions& options) {
     Graph source = load_graph(source_file);
     Graph target = load_graph(target_file);
 
@@ -339,6 +368,10 @@ static int run_from_files(const std::string& source_file,
     int N = source.num_vertices;
     int M = target.num_vertices;
 
+    const bool requested_gpu = use_gpu;
+    const bool indexed = options.backend == "structural-index";
+    if (indexed && (K <= 0 || K > M))
+        throw std::invalid_argument("indexed generation requires 1 <= K <= target count");
     if (K <= 0) K = 20;
     if (K > M) K = M;
 
@@ -349,6 +382,10 @@ static int run_from_files(const std::string& source_file,
 
     std::vector<std::vector<Candidate>> candidates;
     std::vector<NodeFeatures> feats_src, feats_tgt;
+    StructuralIndex target_index;
+    std::vector<NodeFeatures> raw_sources;
+    std::vector<StructuralRetrievalStats> index_stats;
+    double index_build_ms = 0.0;
     double feature_ms = 0.0;
     double candidate_ms = 0.0;
     double similarity_ms = 0.0;
@@ -419,6 +456,12 @@ static int run_from_files(const std::string& source_file,
         Timer feature_timer("CPU feature extraction");
         feats_src = compute_features(source);
         feats_tgt = compute_features(target);
+        if (indexed) {
+            raw_sources = feats_src;
+            Timer index_timer("CPU structural index construction");
+            target_index = build_structural_index(feats_tgt, options.index);
+            index_build_ms = index_timer.elapsed_ms();
+        }
         if (joint_normalize) {
             normalize_features_joint_zscore(feats_src, feats_tgt);
         } else {
@@ -431,13 +474,20 @@ static int run_from_files(const std::string& source_file,
             source_profiles = compute_neighbor_degree_profiles(source);
             target_profiles = compute_neighbor_degree_profiles(target);
         }
-        feature_ms = feature_timer.elapsed_ms();
+        feature_ms = feature_timer.elapsed_ms() - index_build_ms;
+        if (indexed) {
+            Timer candidate_timer("CPU indexed retrieval and scoring");
+            candidates = generate_indexed_top_k_candidates(
+                raw_sources, feats_src, feats_tgt, target_index, K, &index_stats);
+            candidate_ms = candidate_timer.elapsed_ms();
+        } else {
         candidates = generate_top_k_candidates(
             feats_src, feats_tgt, K, feature_mask, feature_weights,
             neighbor_profile_weight > 0.0f ? &source_profiles : nullptr,
             neighbor_profile_weight > 0.0f ? &target_profiles : nullptr,
             neighbor_profile_weight, &similarity_ms, &topk_selection_ms);
         candidate_ms = similarity_ms + topk_selection_ms;
+        }
     }
 
     if (!candidates_file.empty()) {
@@ -556,7 +606,57 @@ static int run_from_files(const std::string& source_file,
             throw std::runtime_error("Cannot open timings output: " + timings_file);
         }
         timings_out << std::setprecision(std::numeric_limits<double>::max_digits10);
+        size_t fallback_sources = 0, scored_pairs = 0;
+        size_t pool_min = index_stats.empty() ? 0 : std::numeric_limits<size_t>::max();
+        size_t pool_max = 0, bucket_pool_sum = 0;
+        int max_radius = -1;
+        for (const auto& stats : index_stats) {
+            const size_t pool = stats.used_exhaustive_fallback ? static_cast<size_t>(M) : stats.bucket_pool_size;
+            fallback_sources += stats.used_exhaustive_fallback;
+            scored_pairs += pool;
+            bucket_pool_sum += stats.bucket_pool_size;
+            pool_min = std::min(pool_min, pool);
+            pool_max = std::max(pool_max, pool);
+            max_radius = std::max(max_radius, stats.final_radius);
+        }
+        size_t occupancy_min = target_index.bucket_keys.empty() ? 0 : std::numeric_limits<size_t>::max();
+        size_t occupancy_max = 0;
+        for (size_t bucket = 0; bucket < target_index.bucket_keys.size(); ++bucket) {
+            size_t count = target_index.bucket_offsets[bucket+1] - target_index.bucket_offsets[bucket];
+            occupancy_min = std::min(occupancy_min, count);
+            occupancy_max = std::max(occupancy_max, count);
+        }
         timings_out << "{\n"
+                    << "  \"requested_mode\": \"" << (requested_gpu ? "gpu" : "cpu") << "\",\n"
+                    << "  \"effective_mode\": \"" << (use_gpu ? "gpu" : "cpu") << "\",\n"
+                    << "  \"candidate_backend\": \"" << (!candidate_input_file.empty() ? "fixed-support" : options.backend) << "\",\n"
+                    << "  \"structural_index\": ";
+        if (indexed) {
+            timings_out << "{\"coordinates\":[\"raw_degree\",\"raw_avg_neighbor_degree\"],"
+                << "\"transform\":\"natural_log1p\",\"neighborhood\":\"chebyshev_complete_shells\","
+                << "\"tie_break\":\"score_descending_target_id_ascending\","
+                << "\"degree_bin_width\":" << options.index.degree_bin_width
+                << ",\"neighbor_bin_width\":" << options.index.neighbor_bin_width
+                << ",\"minimum_radius\":" << options.index.minimum_radius
+                << ",\"maximum_radius\":" << options.index.maximum_radius
+                << ",\"pool_multiplier\":" << options.index.pool_multiplier
+                << ",\"fallback\":\"exhaustive\"},\n"
+                << "  \"index_diagnostics\": {\"index_build_ms\":" << index_build_ms
+                << ",\"occupied_buckets\":" << target_index.bucket_keys.size()
+                << ",\"bucket_occupancy_min\":" << occupancy_min
+                << ",\"bucket_occupancy_max\":" << occupancy_max
+                << ",\"fallback_sources\":" << fallback_sources
+                << ",\"actual_scored_pairs\":" << scored_pairs
+                << ",\"pool_size_min\":" << pool_min << ",\"pool_size_max\":" << pool_max
+                << ",\"pool_size_mean\":" << (N ? static_cast<double>(scored_pairs)/N : 0)
+                << ",\"bucket_pool_size_mean\":" << (N ? static_cast<double>(bucket_pool_sum)/N : 0)
+                << ",\"maximum_observed_radius\":" << max_radius
+                << ",\"index_storage_bytes\":" << target_index.bucket_keys.size()*sizeof(StructuralBucketKey)
+                    + target_index.bucket_offsets.size()*sizeof(size_t) + target_index.target_ids.size()*sizeof(int)
+                << ",\"retrieval_ms\":null,\"scratch_peak_bytes\":null,\"host_peak_bytes\":null},\n";
+        } else timings_out << "null,\n  \"index_diagnostics\": null,\n";
+        timings_out << "  \"index_build_ms\": " << index_build_ms << ",\n"
+
                     << "  \"mode\": \"" << (use_gpu ? "gpu" : "cpu") << "\",\n"
                     << "  \"vertices_source\": " << N << ",\n"
                     << "  \"vertices_target\": " << M << ",\n"
@@ -564,8 +664,8 @@ static int run_from_files(const std::string& source_file,
                     << "  \"normalization_mode\": \"" << (joint_normalize ? "joint_graph_pair" : "separate_per_graph") << "\",\n"
                     << "  \"pipeline_description\": \"" << (!candidate_input_file.empty() ? "Fixed candidate support/costs with CPU assignment and Sinkhorn" : (use_gpu ? "GPU feature/candidate processing with CPU assignment and Sinkhorn" : "CPU feature/candidate processing with CPU assignment and Sinkhorn")) << "\",\n"
                     << "  \"feature_extraction_ms\": " << feature_ms << ",\n"
-                    << "  \"similarity_ms\": " << similarity_ms << ",\n"
-                    << "  \"topk_selection_ms\": " << topk_selection_ms << ",\n"
+                    << "  \"similarity_ms\": " << measured_time_json(similarity_ms, !indexed) << ",\n"
+                    << "  \"topk_selection_ms\": " << measured_time_json(topk_selection_ms, !indexed) << ",\n"
                     << "  \"candidate_generation_ms\": " << candidate_ms << ",\n"
                     << "  \"host_device_transfer_ms\": " << transfer_ms << ",\n"
                     << "  \"csr_construction_ms\": " << csr_ms << ",\n"
@@ -623,9 +723,26 @@ int main(int argc, char** argv) {
     std::vector<float> feature_weights;
     float neighbor_profile_weight = 0.0f;
 
+    CandidateOptions options;
+    try {
     for (int i = 1; i < argc; i++) {
         std::string arg(argv[i]);
-        if (arg == "--toy") {
+        if (arg == "--candidate-backend" || arg.rfind("--index-", 0) == 0) {
+            if (i + 1 >= argc) throw std::invalid_argument("Missing value for " + arg);
+            const std::string value = argv[++i];
+            if (arg == "--candidate-backend") options.backend = value;
+            else {
+                options.explicit_index_options = true;
+                if (arg == "--index-degree-width") options.index.degree_bin_width = parse_index_double(value);
+                else if (arg == "--index-neighbor-width") options.index.neighbor_bin_width = parse_index_double(value);
+                else if (arg == "--index-min-radius") options.index.minimum_radius = parse_index_int(value);
+                else if (arg == "--index-max-radius") options.index.maximum_radius = parse_index_int(value);
+                else if (arg == "--index-pool-multiplier") options.index.pool_multiplier = parse_index_int(value);
+                else if (arg == "--index-fallback") {
+                    if (value != "exhaustive") throw std::invalid_argument("Only exhaustive index fallback is implemented");
+                } else throw std::invalid_argument("Unknown index option: " + arg);
+            }
+        } else if (arg == "--toy") {
             mode = "toy";
         } else if (arg == "--source" && i + 1 < argc) {
             source_file = argv[++i];
@@ -683,6 +800,11 @@ int main(int argc, char** argv) {
         } else if (arg == "--neighbor-profile-weight" && i + 1 < argc) {
             neighbor_profile_weight = std::stof(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
+            std::cout << "  --candidate-backend exhaustive|structural-index (default exhaustive)\n"
+                      << "  --index-degree-width W --index-neighbor-width W (default 0.5)\n"
+                      << "  --index-min-radius R --index-max-radius R (defaults 1,3)\n"
+                      << "  --index-pool-multiplier N (default 4) --index-fallback exhaustive\n"
+                      << "  Indexed scoring currently supports CPU standard six-feature mode only.\n";
             std::cout << "Usage: scgm_cuda [OPTIONS]" << std::endl;
             std::cout << "  --toy                Run 6-node asymmetric correctness test" << std::endl;
             std::cout << "  --source FILE        Source graph file" << std::endl;
@@ -702,6 +824,8 @@ int main(int argc, char** argv) {
             std::cout << "  --feature-weights W  six CPU weights, comma-separated" << std::endl;
             std::cout << "  --neighbor-profile-weight W  CPU neighbor-degree profile weight" << std::endl;
             return 0;
+        } else {
+            throw std::invalid_argument("Unknown option or missing value: " + arg);
         }
     }
 
@@ -709,7 +833,18 @@ int main(int argc, char** argv) {
         mode = "toy";  // Default to toy test
     }
 
-    try {
+    if (options.backend != "exhaustive" && options.backend != "structural-index")
+        throw std::invalid_argument("Unknown candidate backend: " + options.backend);
+    if (options.backend == "exhaustive" && options.explicit_index_options)
+        throw std::invalid_argument("Index options require structural-index backend");
+    if (options.backend == "structural-index") {
+        validate_structural_index_config(options.index);
+        if (mode != "file") throw std::invalid_argument("Indexing requires file mode");
+        if (use_gpu) throw std::invalid_argument("GPU indexed scoring is not implemented; use --cpu");
+        if (!candidate_input_file.empty()) throw std::invalid_argument("Indexing cannot be combined with --candidate-input");
+        if (feature_mask != ALL_FEATURES_MASK || !feature_weights.empty() || neighbor_profile_weight != 0.0f)
+            throw std::invalid_argument("Indexed backend currently supports standard six-feature scoring only");
+    }
         if (mode == "toy") {
             run_toy_test(use_gpu);
         } else if (mode == "file") {
@@ -719,7 +854,7 @@ int main(int argc, char** argv) {
             }
             return run_from_files(source_file, target_file, K, use_gpu, verify, verbose,
                                   output_file, candidates_file, candidate_input_file, matching_output_file, joint_normalize, feature_mask,
-                                  feature_weights, neighbor_profile_weight, timings_file);
+                                  feature_weights, neighbor_profile_weight, timings_file, options);
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

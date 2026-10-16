@@ -1,12 +1,17 @@
 """Repeat native runs and optionally record truth-based quality for each trial."""
 
 import argparse
+import hashlib
 import csv
 import json
 import statistics
 import subprocess
 import time
+import tempfile
 from pathlib import Path
+from index_cli import (add_index_arguments, index_configuration,
+                       native_index_arguments, verify_index_metadata, configuration_id)
+
 
 
 def load_mapping(path):
@@ -45,22 +50,44 @@ def evaluate(candidates_path, assignment_path, truth, n):
 
 
 def run_once(executable, source, target, k, mode, directory, index, truth=None,
-             write_candidates=True):
+             write_candidates=True, candidate_backend="exhaustive", index_config=None,
+             profile_host_memory=False):
     timing_path = directory / f"timings_{mode}_{index}.json"
     assignment_path = directory / f"assignment_{mode}_{index}.csv"
     candidates_path = directory / f"candidates_{mode}_{index}.csv"
     command = [str(executable), "--source", str(source), "--target", str(target),
                "--k", str(k), f"--{mode}"]
+    command.extend(native_index_arguments(candidate_backend, index_config))
     if write_candidates:
         command.extend(("--candidates", str(candidates_path)))
     command.extend(("--output", str(assignment_path), "--timings", str(timing_path)))
+    peak_host_rss_bytes = None
     start = time.perf_counter()
-    completed = subprocess.run(command, capture_output=True, text=True)
+    if profile_host_memory:
+        # Isolated child high-water mark; keep these runs outside timing trials.
+        with tempfile.TemporaryDirectory(prefix="scgm-rss-") as temporary:
+            rss_path = Path(temporary) / "rss.txt"
+            completed = subprocess.run(
+                ["/usr/bin/time", "-f", "%M", "-o", str(rss_path), *command],
+                capture_output=True, text=True)
+            if rss_path.is_file():
+                lines = rss_path.read_text().strip().splitlines()
+                if lines and lines[-1].isdigit():
+                    peak_host_rss_bytes = int(lines[-1]) * 1024
+            if peak_host_rss_bytes is None:
+                raise RuntimeError("GNU time did not report peak RSS")
+    else:
+        completed = subprocess.run(command, capture_output=True, text=True)
     wall_ms = (time.perf_counter() - start) * 1000.0
     timings = json.loads(timing_path.read_text(encoding="utf-8")) if timing_path.exists() else {}
+    if completed.returncode not in (0, 2):
+        raise RuntimeError(f"native execution failed: {completed.stderr}")
+    verify_index_metadata(timings, candidate_backend, index_config, mode)
     run = {**timings, "wall_clock_ms": wall_ms,
            "candidate_export_included": write_candidates,
-           "exit_code": completed.returncode, "stderr": completed.stderr.strip()}
+           "exit_code": completed.returncode, "stderr": completed.stderr.strip(),
+           "peak_host_rss_bytes": peak_host_rss_bytes,
+           "memory_profile_run": profile_host_memory}
     if truth is not None and candidates_path.is_file() and assignment_path.is_file():
         n = len(truth)
         run.update(evaluate(candidates_path, assignment_path, truth, n))
@@ -76,7 +103,7 @@ def run_once(executable, source, target, k, mode, directory, index, truth=None,
 
 def summarize(runs):
     fields = ("wall_clock_ms", "feature_extraction_ms", "similarity_ms", "topk_selection_ms",
-              "candidate_generation_ms", "host_device_transfer_ms", "csr_construction_ms",
+              "candidate_generation_ms", "index_build_ms", "host_device_transfer_ms", "csr_construction_ms",
               "lapjv_ms", "sinkhorn_ms", "csr_memory_bytes",
               "peak_device_application_allocated_bytes", "peak_device_process_memory_bytes",
               "candidate_recall_at_k", "final_accuracy", "assignment_cost",
@@ -109,7 +136,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--discard-artifacts", action="store_true",
                         help="Delete candidate and assignment CSVs after evaluating each run")
+    add_index_arguments(parser)
     args = parser.parse_args()
+    index_config = index_configuration(args, parser)
     for path in (args.executable, args.source, args.target):
         if not path.is_file():
             parser.error(f"file does not exist: {path}")
@@ -119,10 +148,24 @@ def main():
         parser.error("warmup must be nonnegative and trials must be positive")
     truth = load_mapping(args.ground_truth) if args.ground_truth else None
     run_once.discard_artifacts = args.discard_artifacts
+    def digest(path):
+        h = hashlib.sha256()
+        with path.open('rb') as stream:
+            for block in iter(lambda: stream.read(1024*1024), b''): h.update(block)
+        return h.hexdigest()
+    requested = {"mode": args.mode, "candidate_backend": args.candidate_backend,
+                 "structural_index": index_config, "k": args.k,
+                 "source_sha256": digest(args.source), "target_sha256": digest(args.target),
+                 "executable_sha256": digest(args.executable),
+                 "ground_truth_sha256": digest(args.ground_truth) if args.ground_truth else None,
+                 "warmup": args.warmup, "trials": args.trials,
+                 "discard_artifacts": args.discard_artifacts}
+    args.output = args.output / ("config_" + configuration_id(requested))
     args.output.mkdir(parents=True, exist_ok=True)
+    (args.output / "configuration.json").write_text(json.dumps(requested, indent=2) + "\n")
     for index in range(args.warmup):
         run_once(args.executable, args.source, args.target, args.k, args.mode,
-                 args.output, f"warmup_{index}", write_candidates=False)
+                 args.output, f"warmup_{index}", write_candidates=False, candidate_backend=args.candidate_backend, index_config=index_config)
     runs = []
     invariant_quality = None
     quality_fields = ("candidate_recall_at_k", "zero_incoming_targets",
@@ -130,7 +173,7 @@ def main():
     for index in range(args.trials):
         run = run_once(args.executable, args.source, args.target, args.k, args.mode,
                        args.output, index, truth if index == 0 else None,
-                       write_candidates=(index == 0))
+                       write_candidates=(index == 0), candidate_backend=args.candidate_backend, index_config=index_config)
         if index == 0:
             invariant_quality = {field: run[field] for field in quality_fields if field in run}
         elif invariant_quality:
@@ -138,7 +181,8 @@ def main():
             run.update(invariant_quality)
             run["quality_reused_from_trial"] = 0
         runs.append(run)
-    result = {"mode": args.mode,
+    result = {"support_repair": {"enabled": False}, "requested_configuration": requested, "candidate_backend": args.candidate_backend,
+              "structural_index": index_config, "mode": args.mode,
               "pipeline_description": ("GPU feature/candidate processing with CPU assignment and Sinkhorn"
                                        if args.mode == "gpu" else "CPU feature/candidate processing, assignment, and Sinkhorn"),
               "source": str(args.source), "target": str(args.target),
