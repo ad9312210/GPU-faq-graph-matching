@@ -1,278 +1,286 @@
 #include "lapjv.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <vector>
+
 /*
- * Native C++ LAPJV for SPARSE cost matrices in CSR format.
+ * Native CPU sparse primal-dual shortest-augmenting-path solver.
  *
- * This is a Shortest Augmenting Path (SAP) based solver for rectangular
- * or square linear assignment problems on sparse cost matrices.
+ * Contract:
+ *   - Every source row must receive one distinct target column.
+ *   - Rectangular inputs are supported when rows <= columns.
+ *   - Only stored CSR entries are allowed assignments.
+ *   - Stored zero and negative costs are supported.
+ *   - Malformed input throws std::invalid_argument.
+ *   - Valid but infeasible input returns feasible = false.
  *
- * PERMUTATION CONVENTION:
- *   row_to_col[i] = j  means  source i -> target j
+ * Initialization:
+ *   - Empty matching.
+ *   - Row potentials equal row minima.
+ *   - Column potentials equal zero.
  *
- * SPARSE HANDLING:
- *   Only entries present in the CSR are considered as allowed assignments.
- *   Missing entries are FORBIDDEN (not zero cost).
+ * This retains the solve_lapjv interface for compatibility.
+ * It does not implement the full LAPJV initialization sequence.
  *
- * Implementation approach:
- *   Phase 1: Column reduction - for each column, find the minimum cost row
- *            among sparse entries.
- *   Phase 2: Reduction transfer - for rows assigned in phase 1, adjust duals.
- *   Phase 3: Augmenting row reduction.
- *   Phase 4: Augmentation via shortest augmenting path (Dijkstra-like).
- *
- * Because the matrix is sparse, we iterate over CSR entries rather than
- * scanning dense N*M arrays.
- *
- * NO call to scipy, Python, or external programs.
+ * Sparse edges are used for relaxation. Selecting the next
+ * minimum-distance column currently scans all columns.
  */
 
 AssignmentResult solve_lapjv(const CSRMatrix& cost) {
-    int N = cost.rows;
-    int M = cost.cols;
+    const int N = cost.rows;
+    const int M = cost.cols;
+    const double infinity = std::numeric_limits<double>::infinity();
+
+    // Validate dimensions before allocating dimension-dependent arrays.
+    if (N < 0 || M < 0) {
+        throw std::invalid_argument(
+            "solve_lapjv: negative matrix dimensions");
+    }
+
+    // Validate the CSR structure.
+    if (cost.row_ptr.size() != static_cast<std::size_t>(N) + 1 ||
+        cost.col_idx.size() != cost.values.size() ||
+        cost.row_ptr.empty() ||
+        cost.row_ptr.front() != 0) {
+        throw std::invalid_argument(
+            "solve_lapjv: malformed CSR arrays");
+    }
+
+    const std::size_t nnz = cost.values.size();
+
+    for (int row = 0; row < N; ++row) {
+        const int begin = cost.row_ptr[row];
+        const int end = cost.row_ptr[row + 1];
+
+        if (begin < 0 ||
+            end < begin ||
+            static_cast<std::size_t>(end) > nnz) {
+            throw std::invalid_argument(
+                "solve_lapjv: invalid CSR row offsets");
+        }
+
+        int previous_column = -1;
+
+        for (int edge = begin; edge < end; ++edge) {
+            const int column = cost.col_idx[edge];
+
+            if (column < 0 || column >= M ||
+                column <= previous_column) {
+                throw std::invalid_argument(
+                    "solve_lapjv: columns must be in range, "
+                    "sorted, and unique within each row");
+            }
+
+            if (!std::isfinite(cost.values[edge])) {
+                throw std::invalid_argument(
+                    "solve_lapjv: stored costs must be finite");
+            }
+
+            previous_column = column;
+        }
+    }
+
+    if (cost.row_ptr.back() < 0 ||
+        static_cast<std::size_t>(cost.row_ptr.back()) != nnz) {
+        throw std::invalid_argument(
+            "solve_lapjv: final CSR offset does not equal nnz");
+    }
 
     AssignmentResult result;
     result.feasible = false;
     result.total_cost = 0.0;
+    result.row_to_col.assign(N, -1);
+    result.col_to_row.assign(M, -1);
 
+    // The empty assignment has cost zero.
     if (N == 0) {
         result.feasible = true;
         return result;
     }
 
     if (N > M) {
-        // More rows than columns - cannot assign each row to a unique column
-        result.feasible = false;
         return result;
     }
 
-    // Check that each row has at least one candidate
-    for (int i = 0; i < N; i++) {
-        if (cost.row_ptr[i + 1] - cost.row_ptr[i] == 0) {
-            std::cerr << "LAPJV: Row " << i << " has no candidates. Infeasible." << std::endl;
-            result.row_to_col.assign(N, -1);
-            result.col_to_row.assign(M, -1);
-            result.feasible = false;
+    for (int row = 0; row < N; ++row) {
+        if (cost.row_ptr[row] == cost.row_ptr[row + 1]) {
             return result;
         }
     }
 
-    // Build column-to-row reverse index for sparse matrix
-    // For each column j, store the list of (row, value_index) that have j as a candidate
-    std::vector<std::vector<std::pair<int, int>>> col_to_rows(M);
-    for (int i = 0; i < N; i++) {
-        for (int idx = cost.row_ptr[i]; idx < cost.row_ptr[i + 1]; idx++) {
-            int j = cost.col_idx[idx];
-            col_to_rows[j].push_back({i, idx});
+    // Dual potentials:
+    // reduced_cost(row, column) = cost - u[row] - v[column].
+    std::vector<double> u(N, 0.0);
+    std::vector<double> v(M, 0.0);
+
+    for (int row = 0; row < N; ++row) {
+        double minimum = infinity;
+
+        for (int edge = cost.row_ptr[row];
+             edge < cost.row_ptr[row + 1];
+             ++edge) {
+            minimum = std::min(
+                minimum,
+                static_cast<double>(cost.values[edge]));
         }
+
+        u[row] = minimum;
     }
 
-    // Dual variables
-    std::vector<double> u(N, 0.0);  // row duals
-    std::vector<double> v(M, 0.0);  // column duals
-
-    // Assignment
-    std::vector<int> row_to_col(N, -1);
-    std::vector<int> col_to_row(M, -1);
-
-    // Phase 1: Column reduction
-    // For each column, find the row with minimum cost for that column
-    // and tentatively assign it.
-    for (int j = 0; j < M; j++) {
-        if (col_to_rows[j].empty()) continue;
-
-        double min_cost = std::numeric_limits<double>::max();
-        int min_row = -1;
-        for (auto& [row, vidx] : col_to_rows[j]) {
-            double c = (double)cost.values[vidx];
-            if (c < min_cost) {
-                min_cost = c;
-                min_row = row;
-            }
-        }
-        v[j] = min_cost;
-
-        if (min_row >= 0 && row_to_col[min_row] < 0) {
-            row_to_col[min_row] = j;
-            col_to_row[j] = min_row;
-        }
-    }
-
-    // Phase 2: Reduction transfer
-    // For already-assigned rows, update u[i]
-    for (int i = 0; i < N; i++) {
-        if (row_to_col[i] >= 0) {
-            // u[i] = cost[i][row_to_col[i]] - v[row_to_col[i]]
-            // This is 0 from phase 1, but let's compute properly
-            int j = row_to_col[i];
-            double c = (double)get_value(cost, i, j);
-            u[i] = c - v[j];
-        }
-    }
-
-    // Phase 3: Augmenting row reduction
-    // Try to assign remaining unassigned rows
-    for (int i = 0; i < N; i++) {
-        if (row_to_col[i] >= 0) continue;
-
-        // Find the two smallest reduced costs for row i
-        double min1 = std::numeric_limits<double>::max();
-        double min2 = std::numeric_limits<double>::max();
-        int jmin = -1;
-
-        for (int idx = cost.row_ptr[i]; idx < cost.row_ptr[i + 1]; idx++) {
-            int j = cost.col_idx[idx];
-            double reduced = (double)cost.values[idx] - v[j];
-            if (reduced < min1) {
-                min2 = min1;
-                min1 = reduced;
-                jmin = j;
-            } else if (reduced < min2) {
-                min2 = reduced;
-            }
-        }
-
-        if (jmin < 0) continue;
-
-        u[i] = min1;
-        // If min1 < min2, unique minimum -> assign
-        if (min1 < min2 - 1e-10) {
-            if (col_to_row[jmin] < 0) {
-                row_to_col[i] = jmin;
-                col_to_row[jmin] = i;
-            }
-        }
-    }
-
-    // Phase 4: Augmentation via shortest augmenting path
-    // For each unassigned row, find shortest augmenting path
-    // using Dijkstra on the reduced cost graph.
-    std::vector<double> dist(M);
-    std::vector<int> pred(M);
+    std::vector<double> distance(M);
+    std::vector<int> predecessor(M);
     std::vector<bool> scanned(M);
-    std::vector<int> cols_in_list;
 
-    for (int i = 0; i < N; i++) {
-        if (row_to_col[i] >= 0) continue;
+    // Add one source to the matching at each iteration.
+    for (int root = 0; root < N; ++root) {
+        std::fill(distance.begin(), distance.end(), infinity);
+        std::fill(predecessor.begin(), predecessor.end(), -1);
+        std::fill(scanned.begin(), scanned.end(), false);
 
-        // Dijkstra-like shortest augmenting path from row i
-        for (int j = 0; j < M; j++) {
-            dist[j] = std::numeric_limits<double>::max();
-            pred[j] = -1;
-            scanned[j] = false;
-        }
-        cols_in_list.clear();
+        // Initial distances from the unassigned source.
+        for (int edge = cost.row_ptr[root];
+             edge < cost.row_ptr[root + 1];
+             ++edge) {
+            const int column = cost.col_idx[edge];
 
-        // Initialize: scan row i
-        for (int idx = cost.row_ptr[i]; idx < cost.row_ptr[i + 1]; idx++) {
-            int j = cost.col_idx[idx];
-            double reduced = (double)cost.values[idx] - u[i] - v[j];
-            if (reduced < dist[j]) {
-                dist[j] = reduced;
-                pred[j] = i;
-            }
+            distance[column] =
+                static_cast<double>(cost.values[edge])
+                - u[root] - v[column];
+
+            predecessor[column] = root;
         }
 
         int sink = -1;
 
         while (true) {
-            // Find unscanned column with minimum dist
-            double min_dist = std::numeric_limits<double>::max();
-            int jmin = -1;
-            for (int j = 0; j < M; j++) {
-                if (!scanned[j] && dist[j] < min_dist) {
-                    min_dist = dist[j];
-                    jmin = j;
+            int next_column = -1;
+            double minimum_distance = infinity;
+
+            for (int column = 0; column < M; ++column) {
+                if (!scanned[column] &&
+                    distance[column] < minimum_distance) {
+                    minimum_distance = distance[column];
+                    next_column = column;
                 }
             }
 
-            if (jmin < 0 || min_dist >= std::numeric_limits<double>::max() * 0.5) {
-                break;  // No augmenting path found
+            // No free target is reachable from this source.
+            if (next_column == -1) {
+                return result;
             }
 
-            scanned[jmin] = true;
-            cols_in_list.push_back(jmin);
+            scanned[next_column] = true;
 
-            if (col_to_row[jmin] < 0) {
-                // Found free column -> augmenting path found
-                sink = jmin;
+            const int matched_row =
+                result.col_to_row[next_column];
+
+            if (matched_row == -1) {
+                sink = next_column;
                 break;
             }
 
-            // Scan the row assigned to jmin
-            int row_assigned = col_to_row[jmin];
-            for (int idx = cost.row_ptr[row_assigned]; idx < cost.row_ptr[row_assigned + 1]; idx++) {
-                int j2 = cost.col_idx[idx];
-                if (scanned[j2]) continue;
-                double new_dist = min_dist + (double)cost.values[idx]
-                                  - u[row_assigned] - v[j2];
-                if (new_dist < dist[j2]) {
-                    dist[j2] = new_dist;
-                    pred[j2] = row_assigned;
+            // Traverse the matched edge back to its source,
+            // then relax that source's allowed outgoing edges.
+            for (int edge = cost.row_ptr[matched_row];
+                 edge < cost.row_ptr[matched_row + 1];
+                 ++edge) {
+                const int column = cost.col_idx[edge];
+
+                if (scanned[column]) {
+                    continue;
+                }
+
+                const double candidate_distance =
+                    minimum_distance
+                    + static_cast<double>(cost.values[edge])
+                    - u[matched_row] - v[column];
+
+                if (candidate_distance < distance[column]) {
+                    distance[column] = candidate_distance;
+                    predecessor[column] = matched_row;
                 }
             }
         }
 
-        if (sink < 0) {
-            // No augmenting path: infeasible
-            result.row_to_col = row_to_col;
-            result.col_to_row = col_to_row;
-            result.feasible = false;
-            std::cerr << "LAPJV: No augmenting path for row " << i
-                      << ". Assignment infeasible." << std::endl;
-            return result;
-        }
+        const double path_distance = distance[sink];
 
-        // Update dual variables
-        for (int j : cols_in_list) {
-            if (j == sink) {
-                v[j] += dist[j] - dist[sink];
-            } else {
-                // Only update scanned columns
-                double delta = dist[j] - dist[sink];
-                v[j] += delta;
-                if (col_to_row[j] >= 0) {
-                    u[col_to_row[j]] -= delta;
-                }
+        // Update potentials while preserving tight matched edges.
+        u[root] += path_distance;
+
+        for (int column = 0; column < M; ++column) {
+            if (!scanned[column]) {
+                continue;
+            }
+
+            const double change =
+                path_distance - distance[column];
+
+            v[column] -= change;
+
+            const int matched_row = result.col_to_row[column];
+
+            if (matched_row != -1) {
+                u[matched_row] += change;
             }
         }
-        u[i] += dist[sink];
 
-        // Trace back augmenting path and flip assignments
-        int j = sink;
+        // Flip assignments along the augmenting path.
+        int column = sink;
+
         while (true) {
-            int row_in_path = pred[j];
-            // The row pred[j] was previously assigned to some column
-            // (or is the starting row i)
-            int prev_col = row_to_col[row_in_path];
-            row_to_col[row_in_path] = j;
-            col_to_row[j] = row_in_path;
+            const int row = predecessor[column];
+            const int previous_column = result.row_to_col[row];
 
-            if (row_in_path == i) break;
-            j = prev_col;
+            result.row_to_col[row] = column;
+            result.col_to_row[column] = row;
+
+            if (row == root) {
+                break;
+            }
+
+            column = previous_column;
         }
     }
 
-    // Verify complete assignment
-    result.row_to_col = row_to_col;
-    result.col_to_row = col_to_row;
-    result.total_cost = 0.0;
+    // Verify the final matching and recompute its original cost.
+    std::vector<bool> target_used(M, false);
+    double total_cost = 0.0;
+
+    for (int row = 0; row < N; ++row) {
+        const int column = result.row_to_col[row];
+
+        if (column < 0 || column >= M ||
+            target_used[column] ||
+            result.col_to_row[column] != row) {
+            throw std::logic_error(
+                "solve_lapjv: invalid matching produced");
+        }
+
+        target_used[column] = true;
+        bool found = false;
+
+        for (int edge = cost.row_ptr[row];
+             edge < cost.row_ptr[row + 1];
+             ++edge) {
+            if (cost.col_idx[edge] == column) {
+                total_cost +=
+                    static_cast<double>(cost.values[edge]);
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            throw std::logic_error(
+                "solve_lapjv: forbidden edge selected");
+        }
+    }
+
+    result.total_cost = total_cost;
     result.feasible = true;
-
-    for (int i = 0; i < N; i++) {
-        if (row_to_col[i] < 0) {
-            result.feasible = false;
-            std::cerr << "LAPJV: Row " << i << " unassigned after augmentation." << std::endl;
-            return result;
-        }
-        float c = get_value(cost, i, row_to_col[i]);
-        if (c >= SCGM_INF * 0.5f) {
-            result.feasible = false;
-            std::cerr << "LAPJV: Row " << i << " assigned to forbidden column "
-                      << row_to_col[i] << "." << std::endl;
-            return result;
-        }
-        result.total_cost += (double)c;
-    }
-
     return result;
 }

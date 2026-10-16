@@ -88,6 +88,11 @@ target_link_libraries(toy_scgm PRIVATE scgm_lib)
 if(SCGM_BUILD_TESTS)
     enable_testing()
 
+    # Input-driven bridge for independent Python reference validation.
+    # Not a standalone CTest: the caller supplies a sparse problem on stdin.
+    add_executable(assignment_solver_driver tests/assignment_solver_driver.cpp)
+    target_link_libraries(assignment_solver_driver PRIVATE scgm_lib)
+
     set(TEST_SOURCES
         tests/test_features.cpp
         tests/test_permutation.cpp
