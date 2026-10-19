@@ -14,10 +14,11 @@ import time
 from pathlib import Path
 from index_cli import (add_index_arguments, index_configuration,
                        native_index_arguments, verify_index_metadata, configuration_id)
+from topk_cli import (add_topk_arguments, topk_configuration, native_topk_arguments,
+                      verify_topk_metadata, GPUUnavailable)
 
 
 import numpy as np
-from analyze_feature_candidates import audit as audit_features
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import maximum_bipartite_matching
 
@@ -184,8 +185,10 @@ def main():
                         help="Use the native Hopcroft-Karp result instead of recomputing it with SciPy")
     parser.add_argument("--output-dir", type=Path, required=True)
     add_index_arguments(parser)
+    add_topk_arguments(parser)
     args = parser.parse_args()
     index_config = index_configuration(args, parser)
+    topk_config = topk_configuration(args, parser)
 
     for path in (args.executable, args.source, args.target, args.ground_truth):
         if not path.is_file():
@@ -197,7 +200,7 @@ def main():
         parser.error("--repair-max-k must be at least --k")
 
     name = run_name(args.dataset, args.pair_seed, args.noise_percent, args.method, args.k)
-    requested = {"candidate_backend": args.candidate_backend, "structural_index": index_config,
+    requested = {"gpu_topk": topk_config, "candidate_backend": args.candidate_backend, "structural_index": index_config,
                  "mode": args.mode, "k": args.k, "repair_max_k": args.repair_max_k,
                  "support_repair_enabled": not args.no_support_repair,
                  "skip_feature_audit": args.skip_feature_audit,
@@ -256,6 +259,7 @@ def main():
             "--output", str(assignment_path), "--timings", str(timings_path),
         ]
         command.extend(native_index_arguments(args.candidate_backend, index_config))
+        command.extend(native_topk_arguments(topk_config, args.candidate_backend))
         start = time.perf_counter()
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
         wall_ms = (time.perf_counter() - start) * 1000.0
@@ -263,6 +267,7 @@ def main():
         native = json.loads(timings_path.read_text(encoding="utf-8")) if timings_path.exists() else {}
         if completed.returncode not in (0, 2):
             raise RuntimeError(f"native execution failed: {completed.stderr}")
+        verify_topk_metadata(native, topk_config, args.mode, current_k)
         verify_index_metadata(native, args.candidate_backend, index_config, args.mode)
         if not candidates_path.exists():
             raise RuntimeError(f"native run did not write candidates at K={current_k}: {completed.stderr}")
@@ -277,6 +282,12 @@ def main():
         support_diagnostic_ms.append(support_elapsed_ms)
         feature_diagnostics_path = attempt_dir / "feature_diagnostics.json"
         if attempt_index == 0 and not args.skip_feature_audit:
+            # Keep optional feature-audit dependencies out of CLI parsing and
+            # --skip-feature-audit runs.
+            try:
+                from analyze_feature_candidates import audit as audit_features
+            except ModuleNotFoundError as error:
+                raise RuntimeError("Feature audit dependencies unavailable; install experiment dependencies or use --skip-feature-audit") from error
             audit_start = time.perf_counter()
             audit_features(args.source, args.target, candidates_path, args.ground_truth,
                            feature_diagnostics_path, current_k, 1e-6, print_result=False)
@@ -288,6 +299,7 @@ def main():
         checkpoint = {
             "structural_index": native.get("structural_index"),
             "index_diagnostics": native.get("index_diagnostics"),
+            "gpu_topk": native.get("gpu_topk"),
             "k": current_k,
             "candidate_recall": support["candidate_recall"],
             "zero_incoming_targets": support["zero_incoming_targets"],
@@ -406,6 +418,7 @@ def main():
                            "rounds": max(0, len(history)-1),
                            "note": "Separate from bucket-neighborhood expansion and exhaustive retrieval fallback"},
         "requested_configuration": requested,
+        "gpu_topk": final_native.get("gpu_topk"),
         "candidate_backend": args.candidate_backend,
         "structural_index": final_native.get("structural_index"),
         "index_diagnostics": final_native.get("index_diagnostics"),
@@ -484,4 +497,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except GPUUnavailable as error:
+        print(f"SKIPPED: {error}")
+        raise SystemExit(77)

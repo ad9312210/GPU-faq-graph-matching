@@ -1,9 +1,15 @@
 #include "bipartite_matching.hpp"
 #include <queue>
+#include <limits>
+#include <stdexcept>
 
 CandidateSupportStats analyze_candidate_support(
     const std::vector<std::vector<Candidate>>& candidates,
     int num_targets) {
+    if (num_targets < 0)
+        throw std::invalid_argument("target count must be nonnegative");
+    if (candidates.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::overflow_error("source count exceeds matching int capacity");
     const int num_sources = static_cast<int>(candidates.size());
     CandidateSupportStats stats;
     stats.target_incoming_counts.assign(num_targets, 0);
@@ -17,6 +23,8 @@ CandidateSupportStats analyze_candidate_support(
             if (candidate.target < 0 || candidate.target >= num_targets) {
                 throw std::invalid_argument("candidate target is outside the target graph");
             }
+            if (stats.target_incoming_counts[candidate.target] == std::numeric_limits<int>::max())
+                throw std::overflow_error("target incoming count exceeds int capacity");
             stats.target_incoming_counts[candidate.target]++;
         }
     }

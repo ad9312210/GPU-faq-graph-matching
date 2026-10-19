@@ -11,6 +11,8 @@ import tempfile
 from pathlib import Path
 from index_cli import (add_index_arguments, index_configuration,
                        native_index_arguments, verify_index_metadata, configuration_id)
+from topk_cli import (add_topk_arguments, topk_configuration, native_topk_arguments,
+                      verify_topk_metadata, GPUUnavailable)
 
 
 
@@ -51,13 +53,14 @@ def evaluate(candidates_path, assignment_path, truth, n):
 
 def run_once(executable, source, target, k, mode, directory, index, truth=None,
              write_candidates=True, candidate_backend="exhaustive", index_config=None,
-             profile_host_memory=False):
+             profile_host_memory=False, topk_config=None):
     timing_path = directory / f"timings_{mode}_{index}.json"
     assignment_path = directory / f"assignment_{mode}_{index}.csv"
     candidates_path = directory / f"candidates_{mode}_{index}.csv"
     command = [str(executable), "--source", str(source), "--target", str(target),
                "--k", str(k), f"--{mode}"]
     command.extend(native_index_arguments(candidate_backend, index_config))
+    command.extend(native_topk_arguments(topk_config, candidate_backend))
     if write_candidates:
         command.extend(("--candidates", str(candidates_path)))
     command.extend(("--output", str(assignment_path), "--timings", str(timing_path)))
@@ -82,8 +85,9 @@ def run_once(executable, source, target, k, mode, directory, index, truth=None,
     timings = json.loads(timing_path.read_text(encoding="utf-8")) if timing_path.exists() else {}
     if completed.returncode not in (0, 2):
         raise RuntimeError(f"native execution failed: {completed.stderr}")
+    verify_topk_metadata(timings, topk_config, mode, k)
     verify_index_metadata(timings, candidate_backend, index_config, mode)
-    run = {**timings, "wall_clock_ms": wall_ms,
+    run = {**timings, "command": command, "wall_clock_ms": wall_ms,
            "candidate_export_included": write_candidates,
            "exit_code": completed.returncode, "stderr": completed.stderr.strip(),
            "peak_host_rss_bytes": peak_host_rss_bytes,
@@ -137,8 +141,10 @@ def main():
     parser.add_argument("--discard-artifacts", action="store_true",
                         help="Delete candidate and assignment CSVs after evaluating each run")
     add_index_arguments(parser)
+    add_topk_arguments(parser)
     args = parser.parse_args()
     index_config = index_configuration(args, parser)
+    topk_config = topk_configuration(args, parser)
     for path in (args.executable, args.source, args.target):
         if not path.is_file():
             parser.error(f"file does not exist: {path}")
@@ -153,7 +159,7 @@ def main():
         with path.open('rb') as stream:
             for block in iter(lambda: stream.read(1024*1024), b''): h.update(block)
         return h.hexdigest()
-    requested = {"mode": args.mode, "candidate_backend": args.candidate_backend,
+    requested = {"gpu_topk": topk_config, "mode": args.mode, "candidate_backend": args.candidate_backend,
                  "structural_index": index_config, "k": args.k,
                  "source_sha256": digest(args.source), "target_sha256": digest(args.target),
                  "executable_sha256": digest(args.executable),
@@ -165,7 +171,7 @@ def main():
     (args.output / "configuration.json").write_text(json.dumps(requested, indent=2) + "\n")
     for index in range(args.warmup):
         run_once(args.executable, args.source, args.target, args.k, args.mode,
-                 args.output, f"warmup_{index}", write_candidates=False, candidate_backend=args.candidate_backend, index_config=index_config)
+                 args.output, f"warmup_{index}", write_candidates=False, candidate_backend=args.candidate_backend, index_config=index_config, topk_config=topk_config)
     runs = []
     invariant_quality = None
     quality_fields = ("candidate_recall_at_k", "zero_incoming_targets",
@@ -173,7 +179,7 @@ def main():
     for index in range(args.trials):
         run = run_once(args.executable, args.source, args.target, args.k, args.mode,
                        args.output, index, truth if index == 0 else None,
-                       write_candidates=(index == 0), candidate_backend=args.candidate_backend, index_config=index_config)
+                       write_candidates=(index == 0), candidate_backend=args.candidate_backend, index_config=index_config, topk_config=topk_config)
         if index == 0:
             invariant_quality = {field: run[field] for field in quality_fields if field in run}
         elif invariant_quality:
@@ -196,4 +202,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except GPUUnavailable as error:
+        print(f"SKIPPED: {error}")
+        raise SystemExit(77)

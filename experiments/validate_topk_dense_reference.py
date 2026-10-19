@@ -1,13 +1,14 @@
-"""Compare selected native Top-K rows with an independent dense feature reference."""
-
+"""Tolerance-aware end-to-end scoring validation; not an identical-score selection oracle."""
 import argparse
 import csv
 import json
+import math
 import subprocess
 import tempfile
 from pathlib import Path
-
 import numpy as np
+from topk_cli import (add_topk_arguments, topk_configuration, native_topk_arguments,
+                      verify_topk_metadata, GPUUnavailable)
 
 
 def load_graph(path):
@@ -66,113 +67,129 @@ def joint_normalize(source, target):
     return (source - mean) / std, (target - mean) / std
 
 
-def read_native_candidates(path, selected_rows):
-    candidates = {row: [] for row in selected_rows}
-    with path.open(newline="", encoding="utf-8") as stream:
-        for item in csv.DictReader(stream):
-            source = int(item["source"])
-            if source in candidates:
-                candidates[source].append((int(item["target"]), float(item["similarity"])))
-    for source, row in candidates.items():
-        if not row:
-            raise ValueError(f"native candidate export has no row for source {source}")
-    return candidates
+def analyze_dense_row(saved, dense_scores, k, score_tolerance, tie_tolerance):
+    """Compare native score/order invariants exactly and reference scoring tolerantly."""
+    dense_scores = np.asarray(dense_scores, dtype=float)
+    if not 1 <= k <= len(dense_scores) or not np.isfinite(dense_scores).all():
+        raise ValueError('invalid dense scores or K')
+    errors = []
+    ids = [int(target) for target, _ in saved]
+    valid_ids = all(0 <= target < len(dense_scores) for target in ids)
+    finite = all(math.isfinite(score) for _, score in saved)
+    unique = len(ids) == len(set(ids))
+    if len(saved) != k: errors.append('wrong_candidate_count')
+    if not unique: errors.append('duplicate_targets')
+    if not valid_ids: errors.append('target_out_of_range')
+    if not finite: errors.append('nonfinite_native_score')
+    ordered = finite and all(
+        saved[i-1][1] > saved[i][1] or
+        (saved[i-1][1] == saved[i][1] and saved[i-1][0] < saved[i][0])
+        for i in range(1, len(saved)))
+    if not ordered: errors.append('native_order_violation')
+    order = np.lexsort((np.arange(len(dense_scores)), -dense_scores))
+    cutoff = float(dense_scores[order[k-1]])
+    selected = set(ids) if valid_ids else set()
+    outside = [target for target in ids if 0 <= target < len(dense_scores)
+               and dense_scores[target] < cutoff - tie_tolerance]
+    missing = [int(target) for target in np.flatnonzero(dense_scores > cutoff + tie_tolerance)
+               if int(target) not in selected]
+    if outside: errors.append('selected_below_reference_cutoff')
+    if missing: errors.append('omitted_strictly_better_reference_candidate')
+    score_error = (max((abs(float(score)-float(dense_scores[target])) for target, score in saved), default=0.0)
+                   if valid_ids and finite else None)
+    if score_error is not None and score_error > score_tolerance:
+        errors.append('score_error_exceeds_tolerance')
+    return {'k': k, 'native_saved_candidate_count': len(saved),
+            'saved_candidate_count_matches_k': len(saved) == k,
+            'unique_targets': unique, 'native_order_valid': ordered,
+            'dense_cutoff_similarity': cutoff,
+            'dense_cutoff_tie_count': int(np.count_nonzero(np.abs(dense_scores-cutoff) <= tie_tolerance)),
+            'native_dense_topk_overlap': len(selected & set(map(int, order[:k]))),
+            'max_native_vs_dense_similarity_error': score_error,
+            'native_candidates_below_dense_cutoff': outside,
+            'omitted_strictly_better_reference_candidates': missing,
+            'errors': errors, 'pass': not errors}
+
+
+def read_native_candidates(path, selected, n, m):
+    rows = {source: [] for source in selected}
+    with path.open(newline='', encoding='utf-8') as stream:
+        for row in csv.DictReader(stream):
+            source, target, score = int(row['source']), int(row['target']), float(row['similarity'])
+            if not 0 <= source < n or not 0 <= target < m or not math.isfinite(score):
+                raise ValueError('invalid candidate endpoint or score in export')
+            if source in rows:
+                if 'rank' in row and int(row['rank']) != len(rows[source]):
+                    raise ValueError('noncontiguous candidate ranks')
+                rows[source].append((target, score))
+    return rows
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--target", type=Path, required=True)
-    parser.add_argument("--executable", type=Path, default=Path("build-l40s/scgm_cuda"))
-    parser.add_argument("--mode", choices=("cpu", "gpu"), default="cpu")
-    parser.add_argument("--k", type=int, default=64)
-    parser.add_argument("--rows", type=int, nargs="+", default=(0, 1, 17, 512, 2048, 4096, 5240))
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--tie-tolerance", type=float, default=2e-5)
+    parser.add_argument('--source', type=Path, required=True)
+    parser.add_argument('--target', type=Path, required=True)
+    parser.add_argument('--executable', type=Path, default=Path('build-l40s/scgm_cuda'))
+    parser.add_argument('--mode', choices=('cpu','gpu'), default='cpu')
+    parser.add_argument('--k', type=int, default=64)
+    parser.add_argument('--rows', type=int, nargs='+')
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--tie-tolerance', type=float, default=2e-5)
+    parser.add_argument('--score-tolerance', type=float, default=2e-5)
+    add_topk_arguments(parser)
     args = parser.parse_args()
-
-    source_adj = load_graph(args.source)
-    target_adj = load_graph(args.target)
-    if len(source_adj) != len(target_adj):
-        raise ValueError("source and target must have the same number of vertices")
-    if any(row < 0 or row >= len(source_adj) for row in args.rows):
-        raise ValueError("selected source row is out of range")
-    if not args.executable.is_file():
-        raise FileNotFoundError(args.executable)
-
-    x, y = joint_normalize(reference_features(source_adj), reference_features(target_adj))
-    selected = sorted(set(args.rows))
-    with tempfile.TemporaryDirectory(prefix="scgm_dense_ref_") as temp:
-        candidate_path = Path(temp) / "candidates.csv"
-        assignment_path = Path(temp) / "assignment.csv"
-        timing_path = Path(temp) / "timings.json"
-        command = [
-            str(args.executable), "--source", str(args.source), "--target", str(args.target),
-            "--k", str(args.k), f"--{args.mode}", "--candidates", str(candidate_path),
-            "--output", str(assignment_path), "--timings", str(timing_path),
-        ]
-        completed = subprocess.run(command, capture_output=True, text=True)
-        if not candidate_path.exists():
-            raise RuntimeError(
-                f"native candidate export failed ({completed.returncode}): {completed.stderr}"
-            )
-        native = read_native_candidates(candidate_path, selected)
-
-    row_reports = []
-    failures = []
-    for source in selected:
-        dots = y @ x[source]
-        denominators = np.linalg.norm(y, axis=1) * np.linalg.norm(x[source])
-        dense_scores = np.divide(dots, denominators, out=np.zeros_like(dots),
-                                 where=denominators >= 1e-12)
-        order = np.argsort(-dense_scores, kind="stable")
-        cutoff = float(dense_scores[order[args.k - 1]])
-        dense_top = set(int(target) for target in order[:args.k])
-        saved = native[source]
-        saved_targets = {target for target, _ in saved}
-        saved_score_error = max(
-            abs(score - float(dense_scores[target])) for target, score in saved
-        )
-        outside_cutoff = [
-            target for target, _ in saved
-            if dense_scores[target] < cutoff - args.tie_tolerance
-        ]
-        tied_at_cutoff = int(np.count_nonzero(np.abs(dense_scores - cutoff) <= args.tie_tolerance))
-        if outside_cutoff or len(saved) != args.k:
-            failures.append(source)
-        row_reports.append({
-            "source": source,
-            "k": args.k,
-            "dense_cutoff_similarity": cutoff,
-            "native_minimum_similarity": min(score for _, score in saved),
-            "dense_cutoff_tie_count": tied_at_cutoff,
-            "native_dense_topk_overlap": len(saved_targets & dense_top),
-            "native_saved_candidate_count": len(saved),
-            "saved_candidate_count_matches_k": len(saved) == args.k,
-            "max_native_vs_dense_similarity_error": saved_score_error,
-            "native_candidates_below_dense_cutoff": outside_cutoff,
-            "pass": not outside_cutoff,
-        })
-
-    report = {
-        "source_graph": str(args.source),
-        "target_graph": str(args.target),
-        "mode": args.mode,
-        "k": args.k,
-        "selected_rows": selected,
-        "native_exit_code": completed.returncode,
-        "native_exit_note": "Nonzero exit is expected if global candidate support is infeasible at this K; candidate export is still checked.",
-        "reference": "Independent dense cosine computation over six explicitly recomputed features with joint graph-pair normalization; ties at the K boundary are accepted within tolerance.",
-        "all_selected_rows_pass": not failures,
-        "failed_rows": failures,
-        "rows": row_reports,
-    }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(report, indent=2))
-    if failures:
-        raise SystemExit(1)
+    config = topk_configuration(args, parser)
+    if any(not math.isfinite(value) or value < 0 for value in (args.tie_tolerance,args.score_tolerance)):
+        parser.error('tolerances must be finite and nonnegative')
+    source, target = load_graph(args.source), load_graph(args.target)
+    n, m = len(source), len(target)
+    if n == 0 or not 1 <= args.k <= m: parser.error('require nonempty source and 1 <= K <= targets')
+    selected = sorted(set(args.rows if args.rows is not None else [i for i in (0,1,17,n//2,n-1) if 0 <= i < n]))
+    if any(i < 0 or i >= n for i in selected): parser.error('selected row out of range')
+    executable = args.executable.resolve()
+    if not executable.is_file(): parser.error(f'executable missing: {executable}')
+    x, y = joint_normalize(reference_features(source), reference_features(target))
+    report = {'source_graph':str(args.source), 'target_graph':str(args.target), 'mode':args.mode,
+              'k':args.k, 'selected_rows':selected,
+              'validation_scope':'end_to_end_float_scoring_with_tolerances',
+              'selection_oracle_note':'Exact identical-score selection is checked by test_gpu_topk.',
+              'score_tolerance':args.score_tolerance,'cutoff_tolerance':args.tie_tolerance}
+    code = 0
+    try:
+        with tempfile.TemporaryDirectory(prefix='scgm_dense_ref_') as folder:
+            root = Path(folder); candidates = root/'candidates.csv'; timing = root/'timing.json'
+            command = [str(executable),'--source',str(args.source.resolve()),'--target',str(args.target.resolve()),
+                       '--k',str(args.k),f'--{args.mode}','--candidates',str(candidates),
+                       '--output',str(root/'assignment.csv'),'--timings',str(timing)]
+            command += native_topk_arguments(config)
+            completed = subprocess.run(command,capture_output=True,text=True)
+            report.update(native_exit_code=completed.returncode, command=command)
+            if completed.returncode not in (0,2) or not timing.is_file() or not candidates.is_file():
+                raise RuntimeError(f'native candidate run failed: {completed.returncode}: {completed.stderr}')
+            native = json.loads(timing.read_text())
+            verify_topk_metadata(native, config, args.mode, args.k)
+            report['gpu_topk'] = native.get('gpu_topk')
+            rows = read_native_candidates(candidates,selected,n,m)
+        results = []
+        norms = np.linalg.norm(y,axis=1)
+        for source_id in selected:
+            denominators = norms*np.linalg.norm(x[source_id]); dots = y@x[source_id]
+            scores = np.clip(np.divide(dots,denominators,out=np.zeros_like(dots),where=denominators>=1e-12),-1,1)
+            results.append({'source':source_id,**analyze_dense_row(rows[source_id],scores,args.k,
+                           args.score_tolerance,args.tie_tolerance)})
+        report.update(rows=results,failed_rows=[row['source'] for row in results if not row['pass']],
+                      all_selected_rows_pass=all(row['pass'] for row in results))
+        report['status'] = 'passed' if report['all_selected_rows_pass'] else 'failed'
+        code = 0 if report['all_selected_rows_pass'] else 1
+    except GPUUnavailable as error:
+        report.update(status='skipped',reason=str(error),all_selected_rows_pass=False); code=77
+    except (ValueError,RuntimeError,OSError) as error:
+        report.update(status='failed',reason=str(error),all_selected_rows_pass=False); code=1
+    args.output.parent.mkdir(parents=True,exist_ok=True)
+    args.output.write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
+    print(json.dumps(report,indent=2,allow_nan=False))
+    return code
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    raise SystemExit(main())

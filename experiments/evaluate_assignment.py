@@ -4,6 +4,10 @@ import argparse
 import csv
 import json
 from pathlib import Path
+try:
+	from .quality_metrics import load_support, mapping_metrics, support_metrics, fingerprint
+except ImportError:
+	from quality_metrics import load_support, mapping_metrics, support_metrics, fingerprint
 
 
 def read_graph(path):
@@ -29,6 +33,9 @@ def read_graph(path):
 	if header is None:
 		raise ValueError(f"{path}: missing graph header")
 	num_vertices, declared_edges = header
+	if num_vertices < 0 or declared_edges < 0 or any(
+		u < 0 or v >= num_vertices for u, v in edges):
+		raise ValueError(f"{path}: invalid dimensions or edge endpoints")
 	if len(edges) != declared_edges:
 		raise ValueError(
 			f"{path}: header declares {declared_edges} edges, found {len(edges)}"
@@ -61,55 +68,15 @@ def read_candidates(path):
 def evaluate(source_graph, target_graph, assignment, ground_truth, candidates=None):
 	num_vertices, source_edges = source_graph
 	target_vertices, target_edges = target_graph
-	if num_vertices != target_vertices:
-		raise ValueError("source and target graphs have different vertex counts")
-
-	predicted_targets = list(assignment.values())
-	in_range = all(0 <= target < num_vertices for target in predicted_targets)
-	one_to_one = (
-		len(assignment) == num_vertices
-		and set(assignment) == set(range(num_vertices))
-		and in_range
-		and len(set(predicted_targets)) == num_vertices
-	)
-	correct = sum(
-		1 for source in range(num_vertices)
-		if assignment.get(source) == ground_truth.get(source)
-	)
-	mapped_edges = {
-		tuple(sorted((assignment[source], assignment[target])))
-		for source, target in source_edges
-		if source in assignment and target in assignment and in_range
-	}
-	preserved_edges = len(mapped_edges & target_edges)
-	valid_assignment = one_to_one and len(assignment) == num_vertices
-	if candidates is None:
-		candidate_recall = None
-		candidate_recall_note = "Unavailable: pass --candidates from scgm_cuda."
-	else:
-		found = sum(
-			1 for source in range(num_vertices)
-			if ground_truth.get(source) in candidates.get(source, set())
-		)
-		candidate_recall = found / num_vertices
-		candidate_recall_note = "Recall of ground-truth targets in exported Top-K lists."
-	return {
-		"num_vertices": num_vertices,
-		"source_edges": len(source_edges),
-		"target_edges": len(target_edges),
-		"assigned_vertices": len(assignment),
-		"mapping_accuracy": correct / num_vertices if valid_assignment else None,
-		"correct_vertices": correct if valid_assignment else None,
-		"partial_correct_vertices": correct,
-		"one_to_one": one_to_one,
-		"targets_in_range": in_range,
-		"edge_preservation": (preserved_edges / len(source_edges)
-			if valid_assignment and source_edges else (1.0 if valid_assignment else None)),
-		"preserved_edges": preserved_edges if valid_assignment else None,
-		"candidate_recall_at_k": candidate_recall,
-		"candidate_recall_note": candidate_recall_note,
-	}
-
+	# Common metrics validate truth and support rectangular injections.
+	base = mapping_metrics(source_edges, target_edges, assignment, ground_truth,
+		num_vertices, target_vertices)
+	found = None if candidates is None else sum(
+		ground_truth[s] in candidates.get(s, set()) for s in range(num_vertices))
+	base["candidate_recall_at_k"] = None if found is None else (
+		found / num_vertices if num_vertices else 1.0)
+	base["candidate_recall_note"] = "Recall over supplied support; repaired rows may have unequal lengths."
+	return base
 
 def main():
 	parser = argparse.ArgumentParser(description=__doc__)
@@ -119,6 +86,8 @@ def main():
 	parser.add_argument("--ground-truth", type=Path, required=True)
 	parser.add_argument("--candidates", type=Path)
 	parser.add_argument("--output", type=Path)
+	parser.add_argument("--timings", type=Path)
+	parser.add_argument("--variant", default="baseline")
 	args = parser.parse_args()
 
 	source_graph = read_graph(args.source_graph)
@@ -127,10 +96,26 @@ def main():
 	ground_truth = read_mapping(args.ground_truth, "source_vertex", "target_vertex")
 	candidates = read_candidates(args.candidates) if args.candidates else None
 	metrics = evaluate(source_graph, target_graph, assignment, ground_truth, candidates)
+	if args.candidates:
+		support = load_support(args.candidates, source_graph[0], target_graph[0])
+		metrics.update(mapping_metrics(source_graph[1], target_graph[1], assignment,
+			ground_truth, source_graph[0], target_graph[0], support))
+		metrics["support"] = support_metrics(support, target_graph[0])
+	else:
+		metrics["support"] = None
+	metrics["variant"] = args.variant
+	metrics["native_timings"] = json.loads(args.timings.read_text()) if args.timings else None
+	metrics["inputs"] = {key: str(getattr(args, key)) if getattr(args, key) else None
+		for key in ("source_graph", "target_graph", "assignment", "ground_truth", "candidates", "timings")}
+	metrics["input_fingerprints"] = {key: fingerprint(getattr(args, key))
+		for key in ("source_graph", "target_graph", "assignment", "ground_truth", "candidates")
+		if getattr(args, key)}
+	metrics["interpretation"] = "Descriptor optimality does not establish correct correspondence."
 
-	formatted = json.dumps(metrics, indent=2)
+	formatted = json.dumps(metrics, indent=2, allow_nan=False)
 	print(formatted)
 	if args.output:
+		args.output.parent.mkdir(parents=True, exist_ok=True)
 		args.output.write_text(formatted + "\n", encoding="utf-8")
 
 

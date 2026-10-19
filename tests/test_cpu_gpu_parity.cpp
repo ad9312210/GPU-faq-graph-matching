@@ -1,226 +1,133 @@
-#include "common.hpp"
-#include "graph.hpp"
-#include "features.hpp"
-#include "cosine_similarity.hpp"
-#include "candidate_generation.hpp"
-#include "csr_matrix.hpp"
 #include "gpu_matching.hpp"
+#include "cosine_similarity.hpp"
+#include "gpu_test_utils.hpp"
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <random>
+#include <set>
 
-static int run_tests() {
-    int failures = 0;
-
-    // Check GPU availability
-    int device_count = 0;
-    cudaError_t err = cudaGetDeviceCount(&device_count);
-    if (err != cudaSuccess || device_count == 0) {
-        std::cout << "test_cpu_gpu_parity: SKIPPED (no GPU)" << std::endl;
-        return 0;
-    }
-
-    auto gpus = initialize_gpus({0});
-    if (gpus.empty()) {
-        std::cout << "test_cpu_gpu_parity: SKIPPED (GPU init failed)" << std::endl;
-        return 0;
-    }
-
-    // Build the six-node asymmetric test graph
-    std::vector<std::pair<int,int>> src_edges = {
-        {0,1}, {0,5}, {1,2}, {1,3}, {1,4}, {2,3}, {2,5}, {3,4}
-    };
-    Graph source = build_graph(6, src_edges);
-
-    std::vector<std::pair<int,int>> tgt_edges = {
-        {3,0}, {3,2}, {0,5}, {0,1}, {0,4}, {5,1}, {5,2}, {1,4}
-    };
-    Graph target = build_graph(6, tgt_edges);
-
-    int N = 6, M = 6, K = M;
-
-    // CPU path
-    auto cpu_feats_src = compute_features(source);
-    auto cpu_feats_tgt = compute_features(target);
-    normalize_features_joint_zscore(cpu_feats_src, cpu_feats_tgt);
-    auto cpu_candidates = generate_top_k_candidates(cpu_feats_src, cpu_feats_tgt, K);
-
-    // GPU path
-    auto gpu_result = gpu_compute_candidates(source, target, K, gpus[0]);
-    auto& gpu_feats_src = gpu_result.feats_source;
-    auto& gpu_feats_tgt = gpu_result.feats_target;
-    auto& gpu_candidates = gpu_result.candidates;
-
-    float tol = 1e-3f;  // Tolerance for float comparison
-
-    // Test 1: Feature values approximately equal
-    std::cout << "Checking feature parity..." << std::endl;
-    for (int i = 0; i < N; i++) {
-        for (int f = 0; f < NUM_FEATURES; f++) {
-            float cpu_val = cpu_feats_src[i].as_array(f);
-            float gpu_val = gpu_feats_src[i].as_array(f);
-            float err_val = std::abs(cpu_val - gpu_val);
-            if (err_val > tol) {
-                std::cerr << "FAIL: Source feature mismatch: node=" << i
-                          << " feature=" << f
-                          << " CPU=" << cpu_val
-                          << " GPU=" << gpu_val
-                          << " abs_error=" << err_val << std::endl;
-                failures++;
-            }
-        }
-    }
-
-    for (int i = 0; i < M; i++) {
-        for (int f = 0; f < NUM_FEATURES; f++) {
-            float cpu_val = cpu_feats_tgt[i].as_array(f);
-            float gpu_val = gpu_feats_tgt[i].as_array(f);
-            float err_val = std::abs(cpu_val - gpu_val);
-            if (err_val > tol) {
-                std::cerr << "FAIL: Target feature mismatch: node=" << i
-                          << " feature=" << f
-                          << " CPU=" << cpu_val
-                          << " GPU=" << gpu_val
-                          << " abs_error=" << err_val << std::endl;
-                failures++;
-            }
-        }
-    }
-
-    // Test 2: Similarity values approximately equal
-    std::cout << "Checking similarity parity..." << std::endl;
-    for (int i = 0; i < N; i++) {
-        for (auto& cpu_c : cpu_candidates[i]) {
-            float cpu_sim = cpu_c.similarity;
-            // Find same target in GPU candidates
-            float gpu_sim = -999.0f;
-            for (auto& gpu_c : gpu_candidates[i]) {
-                if (gpu_c.target == cpu_c.target) {
-                    gpu_sim = gpu_c.similarity;
-                    break;
-                }
-            }
-            if (gpu_sim > -998.0f) {
-                float err_val = std::abs(cpu_sim - gpu_sim);
-                if (err_val > tol) {
-                    std::cerr << "FAIL: Similarity mismatch: node=" << i
-                              << " candidate=" << cpu_c.target
-                              << " CPU=" << cpu_sim
-                              << " GPU=" << gpu_sim
-                              << " abs_error=" << err_val << std::endl;
-                    failures++;
-                }
-            }
-        }
-    }
-
-    // Test 3: Top-K candidate sets equal
-    std::cout << "Checking top-K candidate set parity..." << std::endl;
-    for (int i = 0; i < N; i++) {
-        std::set<int> cpu_set, gpu_set;
-        for (auto& c : cpu_candidates[i]) cpu_set.insert(c.target);
-        for (auto& c : gpu_candidates[i]) gpu_set.insert(c.target);
-
-        if (cpu_set != gpu_set) {
-            std::cerr << "FAIL: Candidate set mismatch for node " << i << std::endl;
-            std::cerr << "  CPU: {";
-            for (int t : cpu_set) std::cerr << t << " ";
-            std::cerr << "}" << std::endl;
-            std::cerr << "  GPU: {";
-            for (int t : gpu_set) std::cerr << t << " ";
-            std::cerr << "}" << std::endl;
-            failures++;
-        }
-    }
-
-    // Test 4: CSR construction parity
-    std::cout << "Checking CSR parity..." << std::endl;
-    auto cpu_csr = build_sparse_cost_matrix(cpu_candidates, N, M);
-    auto gpu_csr = build_sparse_cost_matrix(gpu_candidates, N, M);
-
-    // row_ptr equal
-    if (cpu_csr.row_ptr != gpu_csr.row_ptr) {
-        std::cerr << "FAIL: CSR row_ptr mismatch" << std::endl;
-        failures++;
-    }
-
-    // col_idx equal (after both are sorted)
-    if (cpu_csr.col_idx != gpu_csr.col_idx) {
-        std::cerr << "FAIL: CSR col_idx mismatch" << std::endl;
-        failures++;
-    }
-
-    // values approximately equal
-    if (cpu_csr.values.size() == gpu_csr.values.size()) {
-        for (int j = 0; j < (int)cpu_csr.values.size(); j++) {
-            float err_val = std::abs(cpu_csr.values[j] - gpu_csr.values[j]);
-            if (err_val > tol) {
-                std::cerr << "FAIL: CSR values[" << j << "] CPU=" << cpu_csr.values[j]
-                          << " GPU=" << gpu_csr.values[j]
-                          << " abs_error=" << err_val << std::endl;
-                failures++;
-            }
-        }
-    } else {
-        std::cerr << "FAIL: CSR values size mismatch" << std::endl;
-        failures++;
-    }
-
-    // Regression: cross multiple 256-target tiles with K larger than one tile.
-    // Every source must receive exactly K unique, best-first candidates.
-    {
-        std::mt19937 generator(173);
-        std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
-        auto random_features = [&]() {
-            return NodeFeatures{distribution(generator), distribution(generator),
-                                distribution(generator), distribution(generator),
-                                distribution(generator), distribution(generator)};
-        };
-        std::vector<NodeFeatures> tile_sources(4), tile_targets(513);
-        for (auto& feature : tile_sources) feature = random_features();
-        for (auto& feature : tile_targets) feature = random_features();
-        constexpr int tile_k = 512;
-        const auto expected = generate_top_k_candidates(tile_sources, tile_targets, tile_k);
-        const auto actual = gpu_compute_topk(tile_sources, tile_targets, tile_k, gpus[0]);
-        if (actual.size() != tile_sources.size()) {
-            std::cerr << "FAIL: multi-tile Top-K returned wrong row count" << std::endl;
-            failures++;
-        } else {
-            for (size_t row = 0; row < actual.size(); ++row) {
-                std::set<int> expected_targets, actual_targets;
-                for (const auto& candidate : expected[row]) expected_targets.insert(candidate.target);
-                for (const auto& candidate : actual[row]) actual_targets.insert(candidate.target);
-                if (actual[row].size() != tile_k || actual_targets.size() != tile_k) {
-                    std::cerr << "FAIL: multi-tile Top-K row " << row
-                              << " did not contain K unique targets" << std::endl;
-                    failures++;
-                }
-                if (expected_targets != actual_targets) {
-                    std::cerr << "FAIL: multi-tile CPU/GPU Top-K support differs on row "
-                              << row << std::endl;
-                    failures++;
-                }
-                for (size_t rank = 1; rank < actual[row].size(); ++rank) {
-                    if (actual[row][rank - 1].similarity + 1e-6f <
-                        actual[row][rank].similarity) {
-                        std::cerr << "FAIL: multi-tile GPU row is not score-sorted" << std::endl;
-                        failures++;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    cleanup_gpus(gpus);
-
-    if (failures == 0) {
-        std::cout << "test_cpu_gpu_parity: ALL PASSED" << std::endl;
-    } else {
-        std::cout << "test_cpu_gpu_parity: " << failures << " FAILURES" << std::endl;
-    }
-
-    return failures;
+namespace {
+constexpr float FEATURE_ABS = 2e-5f, FEATURE_REL = 2e-4f, SCORE_TOL = 1e-4f;
+bool close(float a, float b, float absolute, float relative = 0) {
+    return std::isfinite(a) && std::isfinite(b) &&
+        std::abs(a-b) <= absolute + relative * std::max(std::abs(a), std::abs(b));
 }
-
+void feature_parity(const std::vector<NodeFeatures>& a, const std::vector<NodeFeatures>& b) {
+    gpu_test_require(a.size() == b.size(), "Feature row count mismatch");
+    for (std::size_t row = 0; row < a.size(); ++row)
+        for (int f = 0; f < NUM_FEATURES; ++f)
+            gpu_test_require(close(a[row].as_array(f), b[row].as_array(f), FEATURE_ABS, FEATURE_REL),
+                             "CPU/GPU feature error exceeds declared tolerance");
+}
+void exact_rows(const std::vector<std::vector<Candidate>>& a,
+                const std::vector<std::vector<Candidate>>& b) {
+    gpu_test_require(a.size() == b.size(), "Exact parity row count mismatch");
+    for (std::size_t row = 0; row < a.size(); ++row) {
+        gpu_test_require(a[row].size() == b[row].size(), "Exact parity length mismatch");
+        for (std::size_t rank = 0; rank < a[row].size(); ++rank) {
+            gpu_test_require(a[row][rank].target == b[row][rank].target,
+                             "Shared GPU scoring kernel yielded different selected IDs");
+            gpu_test_require(std::memcmp(&a[row][rank].similarity, &b[row][rank].similarity, sizeof(float)) == 0,
+                             "Shared GPU scoring kernel yielded different score bits");
+        }
+    }
+}
+void scoring_parity(const std::vector<NodeFeatures>& cpu_source,
+                    const std::vector<NodeFeatures>& cpu_target,
+                    const std::vector<std::vector<Candidate>>& actual, int k) {
+    gpu_test_require(actual.size() == cpu_source.size(), "Wrong candidate row count");
+    double maximum_error = 0;
+    for (std::size_t source = 0; source < actual.size(); ++source) {
+        const auto& row = actual[source];
+        gpu_test_require(row.size() == static_cast<std::size_t>(k), "Wrong K");
+        std::vector<float> scores(cpu_target.size());
+        for (std::size_t target = 0; target < cpu_target.size(); ++target) {
+            scores[target] = cosine_similarity(cpu_source[source], cpu_target[target]);
+            gpu_test_require(std::isfinite(scores[target]), "Nonfinite CPU reference score");
+        }
+        std::vector<float> sorted = scores;
+        std::sort(sorted.begin(), sorted.end(), std::greater<float>());
+        const float cutoff = sorted[k-1];
+        std::set<int> selected;
+        for (std::size_t rank = 0; rank < row.size(); ++rank) {
+            const auto candidate = row[rank];
+            gpu_test_require(candidate.target >= 0 && static_cast<std::size_t>(candidate.target) < scores.size(),
+                             "Target outside graph");
+            gpu_test_require(selected.insert(candidate.target).second, "Duplicate output target");
+            gpu_test_require(close(candidate.similarity, scores[candidate.target], SCORE_TOL),
+                             "CPU/GPU scoring error exceeds declared tolerance");
+            maximum_error = std::max(maximum_error, static_cast<double>(std::abs(candidate.similarity-scores[candidate.target])));
+            gpu_test_require(scores[candidate.target] >= cutoff - SCORE_TOL,
+                             "Selected target is strictly below CPU cutoff tolerance");
+            if (rank) {
+                const auto previous = row[rank-1];
+                gpu_test_require(previous.similarity > candidate.similarity ||
+                    (previous.similarity == candidate.similarity && previous.target < candidate.target),
+                    "Native output violates exact score/ID ordering");
+            }
+        }
+        // Near-cutoff substitutions can follow float32 scoring differences;
+        // omitting a clearly better CPU candidate cannot.
+        for (std::size_t target = 0; target < scores.size(); ++target)
+            if (scores[target] > cutoff + SCORE_TOL)
+                gpu_test_require(selected.count(static_cast<int>(target)) == 1,
+                                 "Omitted CPU candidate strictly above cutoff tolerance");
+    }
+    std::cout << "maximum CPU/GPU selected-score error=" << maximum_error << '\n';
+}
+Graph random_graph(int n, unsigned seed) {
+    std::mt19937 rng(seed); std::vector<std::pair<int,int>> edges;
+    for (int a = 0; a < n; ++a) for (int b = a+1; b < n; ++b)
+        if (rng()%5 == 0) edges.emplace_back(a,b);
+    return build_graph(n, edges);
+}
+void graph_case(const Graph& source, const Graph& target, int k, const GPUContext& context) {
+    auto cpu_source = compute_features(source), cpu_target = compute_features(target);
+    const auto gpu_raw_source = gpu_compute_features(source, context, nullptr, false);
+    const auto gpu_raw_target = gpu_compute_features(target, context, nullptr, false);
+    feature_parity(cpu_source, gpu_raw_source); feature_parity(cpu_target, gpu_raw_target);
+    normalize_features_joint_zscore(cpu_source, cpu_target);
+    GPUTopKOptions options; options.batch_candidates = 256; options.scratch_budget_bytes = 8196;
+    const auto parallel = gpu_compute_candidates(source, target, k, context, true, GPUSelector::Parallel, options);
+    feature_parity(cpu_source, parallel.feats_source); feature_parity(cpu_target, parallel.feats_target);
+    scoring_parity(cpu_source, cpu_target, parallel.candidates, k);
+    options.force_streaming_serial = true;
+    const auto serial = gpu_compute_candidates(source, target, k, context, true, GPUSelector::SerialHeap, options);
+    // Both paths use the identical GPU score_span producer; this is exact parity.
+    exact_rows(serial.candidates, parallel.candidates);
+    const auto legacy = gpu_compute_topk(parallel.feats_source, parallel.feats_target, k, context);
+    scoring_parity(cpu_source, cpu_target, legacy, k);
+    const auto indexed = gpu_compute_indexed_candidates(source, target, k, StructuralIndexConfig{},
+        context, true, GPUSelector::Parallel, options);
+    const auto indexed_serial = gpu_compute_indexed_candidates(source, target, k, StructuralIndexConfig{},
+        context, true, GPUSelector::SerialHeap, options);
+    exact_rows(indexed.matching.candidates, indexed_serial.matching.candidates);
+    // Indexed pools need not equal exhaustive pools. The independent indexed
+    // pool oracle is covered by test_gpu_topk_streaming and structural-index tests.
+}
+} // namespace
 int main() {
-    return run_tests();
+    if (const int available = gpu_test_availability()) return available;
+    try {
+        GPUTestContext context;
+        const auto toy = build_graph(6, {{0,1},{0,5},{1,2},{1,3},{1,4},{2,3},{2,5},{3,4}});
+        for (int k : {1,3,6}) graph_case(toy, toy, k, context.value);
+        graph_case(build_graph(4, {}), build_graph(17, {}), 8, context.value);
+        for (unsigned seed : {173u,9173u})
+            graph_case(random_graph(17, seed), random_graph(23, seed+1), 8, context.value);
+        std::mt19937 rng(173); std::uniform_real_distribution<float> random(-1,1);
+        std::vector<NodeFeatures> sources(4), targets(513);
+        for (auto* features : {&sources, &targets}) for (auto& f : *features)
+            f = NodeFeatures{random(rng),random(rng),random(rng),random(rng),random(rng),random(rng)};
+        GPUTopKOptions options; options.batch_candidates = 256; options.scratch_budget_bytes = 8196;
+        GPUSelectionInfo info;
+        const auto result = gpu_compute_topk(sources, targets, 512, context.value,
+            nullptr, nullptr, nullptr, nullptr, GPUSelector::Parallel, options, &info);
+        gpu_test_require(info.used == GPUSelector::SerialHeap && info.fallback == GPUFallbackReason::UnsupportedK,
+                         "K512/513-target fallback not preserved");
+        scoring_parity(sources, targets, result, 512);
+        std::cout << "test_cpu_gpu_parity: PASSED; exact selection and scoring-tolerance checks are separate\n";
+        return 0;
+    } catch (const std::exception& e) { std::cerr << "test_cpu_gpu_parity: " << e.what() << '\n'; return 1; }
 }

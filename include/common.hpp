@@ -67,6 +67,41 @@ struct GPUContext {
     GPUContext() : device_id(0), stream(nullptr) {}
 };
 
+// Explicit multi-device requests are strict: never silently drop a device.
+inline void validate_gpu_device_ids(const std::vector<int>& ids) {
+    if (ids.empty()) throw std::invalid_argument("GPU device list must not be empty");
+    int count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&count));
+    std::set<int> unique;
+    for (int id : ids)
+        if (id < 0 || id >= count || !unique.insert(id).second)
+            throw std::invalid_argument("GPU IDs must be available, nonnegative, and unique");
+}
+
+// Thread-local execution owner. Destroy device buffers before this owner.
+class GPUContextOwner {
+    GPUContext context_;
+public:
+    explicit GPUContextOwner(int device) {
+        CUDA_CHECK(cudaSetDevice(device));
+        context_.device_id = device;
+        CUDA_CHECK(cudaStreamCreate(&context_.stream));
+    }
+    GPUContextOwner(const GPUContextOwner&) = delete;
+    GPUContextOwner& operator=(const GPUContextOwner&) = delete;
+    ~GPUContextOwner() noexcept {
+        if (!context_.stream) return;
+        int previous = -1;
+        const bool restore = cudaGetDevice(&previous) == cudaSuccess;
+        if (cudaSetDevice(context_.device_id) == cudaSuccess) {
+            (void)cudaStreamSynchronize(context_.stream);
+            (void)cudaStreamDestroy(context_.stream);
+        }
+        if (restore && previous != context_.device_id) (void)cudaSetDevice(previous);
+    }
+    const GPUContext& get() const noexcept { return context_; }
+};
+
 inline std::vector<GPUContext> initialize_gpus(const std::vector<int>& device_ids = {0}) {
     std::vector<GPUContext> contexts;
     int device_count = 0;

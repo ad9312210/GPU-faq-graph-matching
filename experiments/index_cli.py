@@ -24,8 +24,6 @@ def index_configuration(args, parser):
         if any(value is not None for value in values.values()):
             parser.error('index options require --candidate-backend structural-index')
         return None
-    if args.mode != 'cpu':
-        parser.error('GPU indexed scoring is not implemented; use --mode cpu')
     defaults = dict(degree_bin_width=.5, neighbor_bin_width=.5,
                     minimum_radius=1, maximum_radius=3, pool_multiplier=4,
                     fallback='exhaustive')
