@@ -8,7 +8,6 @@ cmake_install.cmake
 compile_commands.json
 Makefile
 Testing/
-docs/
 *.o
 *.obj
 *.a
